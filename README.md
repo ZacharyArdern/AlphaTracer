@@ -13,7 +13,8 @@ for (1) finding homologs in the AlphaFold DB and (2) producing Cα traces of inp
 
 The full code and a manuscript with benchmarking results are in preparation. 
 The current code takes an average of ~0.1s/protein of 200aas as compared to >1s for ESMfold, and further speed-up is expected. 
-The speed advantage over using only ESMfold will depend on whether relatively similar sequences already have structures in the AlphaFold Database.
+The speed advantage over using only ESMfold will depend on whether relatively similar sequences already have structures in the AlphaFold Database. 
+I am making use of Minifold https://github.com/jwohlwend/minifold in the version currently under development. 
 
 
 <!-- GETTING STARTED -->

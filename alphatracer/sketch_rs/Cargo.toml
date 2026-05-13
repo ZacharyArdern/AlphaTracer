@@ -1,0 +1,37 @@
+[package]
+name = "sketch-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sketch"
+path = "src/main.rs"
+
+[[bin]]
+name = "search"
+path = "src/search.rs"
+
+[[bin]]
+name = "build-index"
+path = "src/build_index.rs"
+
+[[bin]]
+name = "index-seqs"
+path = "src/index_seqs.rs"
+
+[[bin]]
+name = "cluster"
+path = "src/cluster.rs"
+
+[dependencies]
+rayon = "1"
+parquet = { version = "55", features = ["arrow"] }
+arrow-array = "55"
+arrow-schema = "55"
+arrow-cast = "55"
+rustc-hash = "2"
+needletail = "0.5"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3

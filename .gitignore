@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.pth
+.env
+.venv/
+venv/
+
+# Rust build artifacts (cached externally)
+alphatracer/sketch_rs/target/
+
+# AFDB data files
+*.pq
+*.sidx
+*.pkl
+*.dmnd
+
+# AlphaFold downloads and pipeline outputs
+*.cif
+*.pdb
+*.json

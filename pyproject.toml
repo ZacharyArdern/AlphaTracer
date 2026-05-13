@@ -1,0 +1,113 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alphatracer"
+version = "0.2.0"
+description = "AlphaTracer — homology-guided protein structure prediction pipeline"
+requires-python = ">=3.11"
+
+# ── Core dependencies (always required) ───────────────────────────────────────
+# These cover Class A (kmer), B, C, and D on Apple Silicon (MLX backend).
+# Platform-specific and optional deps are listed under [project.optional-dependencies].
+dependencies = [
+    # Data / IO
+    "polars>=1.0",
+    "pyarrow>=14.0",
+    "duckdb>=1.0",
+    "biopython>=1.80",
+    # Alignment / structure
+    "parasail-python>=1.3",
+    "gemmi>=0.6",
+    # Network
+    "pycurl>=7.45",
+    # Numerics
+    "numpy>=1.26",
+    "scipy>=1.12",
+    # Graph (PAE domain detection)
+    "igraph>=0.11",
+    # Molecular dynamics (loop closing / minimisation)
+    "openmm>=8.0",
+    # Progress bars
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+# Apple Silicon — MLX inference backend (Class C/D structure prediction)
+mlx = [
+    "mlx>=0.16",
+    "minifold-mlx>=0.1.0",
+]
+
+# Linux / cloud — PyTorch + ESM2 inference backend
+cuda = [
+    "torch>=2.2",
+    "fair-esm>=2.0",
+    # Install torch with CUDA support separately, e.g.:
+    #   pip install torch --index-url https://download.pytorch.org/whl/cu121
+    # Then: pip install git+https://github.com/jwohlwend/minifold.git
+]
+
+# CPU-only fallback (same packages as cuda, CPU-only torch build)
+cpu = [
+    "torch>=2.2",
+    "fair-esm>=2.0",
+]
+
+# ProMod3 loop-closing backend — OST/ProMod3 must be installed at the system level;
+# it is not pip-installable. See https://openstructure.org/promod3/
+promod3 = []
+
+# Everything pip-installable (mlx + cuda; excludes promod3 and non-PyPI packages)
+all = ["alphatracer[mlx,cuda]"]
+
+[project.scripts]
+alphatracer = "alphatracer.run_alphatracer:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["alphatracer*"]
+
+[tool.setuptools.package-data]
+alphatracer = ["*.py", "sketch_rs/**/*"]
+
+# ── Bundled third-party code ───────────────────────────────────────────────────
+#
+# pae_to_domains.py is vendored directly from:
+#   https://github.com/tristanic/pae_to_domains
+# Copyright (c) 2021 Tristan Croll. MIT License. No modifications made.
+
+# ── Notes on non-pip dependencies ─────────────────────────────────────────────
+#
+# 1. Rust toolchain (required for kmer search on first run)
+#    The sketch-rs source is bundled in the package. On first use, AlphaTracer
+#    compiles it automatically with cargo into ~/.cache/alphatracer/.
+#    Install Rust once with: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+#    Binaries are cached permanently after the first build (~30s one-time cost).
+#    Override cache location with: AT_CACHE_DIR=/your/path
+#
+# 2. AFDB data (required for all classes)
+#    Download afdb_v6_reps.pq and build the kmer sketch index:
+#      python AT_classA_kmer.py --help   # auto-builds index on first run
+#    Default data dir: ~/Science/Data/AFDB/
+#    Override via AFDB_DIR in AT_classA_kmer.py / AT_classA.py.
+#
+# 4. DIAMOND (optional — only needed with --diamond flag for Class A)
+#    Install via conda: conda install -c bioconda diamond
+#    Or: apt install diamond / brew install diamond
+#
+# 5. ProMod3 / OST (optional — only needed with --loop-closer promod3)
+#    Binary packages: https://openstructure.org/promod3/doc/3.6.0/gettingstarted.html
+#    Or use the official Docker image: registry.scicore.unibas.ch/schwede/promod3
+
+# ── Quick-start (Apple Silicon, MLX backend) ──────────────────────────────────
+#
+#   git clone <this repo>
+#   cd AlphaTracer0.2
+#
+#   # 1. Install Python deps (pae_to_domains bundled; minifold-mlx pulled from PyPI)
+#   pip install -e ".[mlx]"
+#
+#   # 2. Run — sketch-rs built automatically on first use (~30s, requires Rust toolchain)
+#   python run_alphatracer.py -i proteins.fasta

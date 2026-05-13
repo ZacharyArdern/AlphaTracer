@@ -44,7 +44,7 @@ def _tqdm(it, **kw):
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
-AFDB_DIR   = os.environ.get('AT_AFDB_DIR', os.path.expanduser("~/Science/Data/AFDB"))
+AFDB_DIR   = os.environ.get('AT_AFDB_DIR', os.getcwd())
 REPS_PQ    = os.path.join(AFDB_DIR, "afdb_v6_reps.pq")
 SIDX_CACHE = os.path.join(AFDB_DIR, "afdb_v6_reps_sketches.sidx")
 ANN_CACHE  = os.path.join(AFDB_DIR, "afdb_v6_reps_ann_cache.pkl")  # progressive cross-run cache
@@ -476,21 +476,38 @@ def stage_download(classA_df, pdb_dir, threads):
             return f'failed:{afdb_id}:{e}'
 
     afdb_list = list(afdb_ids)
+
+    # ── first pass (threaded) ──────────────────────────────────────────────
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futures = {ex.submit(_fetch, aid): aid for aid in afdb_list}
-        results = []
+        results = {}
         pbar = _tqdm(as_completed(futures), total=len(afdb_list), unit="pdb") \
                if HAS_TQDM else as_completed(futures)
         for fut in pbar:
-            results.append(fut.result())
+            aid = futures[fut]
+            r = fut.result()
+            results[aid] = r
+            if r.startswith('fail'):
+                time.sleep(0.5)
 
-    summary = Counter(r.split(':')[0] for r in results)
-    for r in results:
-        if r.startswith('failed'):
+    # ── retry failures ─────────────────────────────────────────────────────
+    retry = [aid for aid, r in results.items() if r.startswith('fail')]
+    if retry:
+        print(f'  Retrying {len(retry)} failed download(s)...')
+        for aid in retry:
+            r = _fetch(aid)
+            results[aid] = r
+            if r.startswith('fail'):
+                time.sleep(0.5)
+
+    all_results = list(results.values())
+    summary = Counter(r.split(':')[0] for r in all_results)
+    for r in all_results:
+        if r.startswith('fail'):
             print(f'  FAILED: {r}')
     print(f"  Downloaded: {summary['downloaded']}  "
           f"Already present: {summary['exists']}  "
-          f"Failed: {summary['failed']}")
+          f"Failed: {summary.get('failed', 0) + summary.get('fail', 0)}")
 
 
 # ── Stage 5: build output PDBs ─────────────────────────────────────────────────

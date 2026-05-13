@@ -261,12 +261,12 @@ fn search_v2(
     query_sketches: &[Vec<u32>],
     min_shared: u32,
     top_k: usize,
+    n_hash_search: usize,
 ) -> Vec<Vec<(u32, u32)>> {
     let data = idx.data();
     let inv  = &idx.inv;
     query_sketches.par_iter().map(|sk| {
-        // Collect all matching seq_idx values (with duplicates = shared hash count),
-        // then sort and count runs. Avoids FxHashMap cache misses for large posting lists.
+        let sk = &sk[..n_hash_search.min(sk.len())];
         let mut hits: Vec<u32> = Vec::with_capacity(sk.len() * 64);
         for &h in sk {
             if let Some(&(start, end)) = inv.get(&h) {
@@ -300,8 +300,10 @@ fn search_eager(
     query_sketches: &[Vec<u32>],
     min_shared: u32,
     top_k: usize,
+    n_hash_search: usize,
 ) -> Vec<Vec<(u32, u32)>> {
     query_sketches.par_iter().map(|sk| {
+        let sk = &sk[..n_hash_search.min(sk.len())];
         let mut hits: Vec<u32> = Vec::with_capacity(sk.len() * 64);
         for &h in sk {
             if let Some(posting) = inv.get(&h) {
@@ -333,10 +335,12 @@ fn main() {
     }
     let db_path    = &args[1];
     let query_fa   = &args[2];
-    let top_k      = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(TOP_K);
-    let min_shared = args.get(4).and_then(|s| s.parse::<u32>().ok()).unwrap_or(MIN_SHARED);
-    let max_freq   = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(MAX_FREQ);
-    let k          = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_K);
+    let top_k          = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(TOP_K);
+    let min_shared     = args.get(4).and_then(|s| s.parse::<u32>().ok()).unwrap_or(MIN_SHARED);
+    let max_freq       = args.get(5).and_then(|s| s.parse().ok()).unwrap_or(MAX_FREQ);
+    let k              = args.get(6).and_then(|s| s.parse().ok()).unwrap_or(DEFAULT_K);
+    // 0 = use all hashes (default); any other value caps the search to that many hashes
+    let n_hash_search: usize = args.get(7).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let dayhoff = Arc::new(build_dayhoff());
     let t0 = Instant::now();
@@ -378,7 +382,8 @@ fn main() {
 
         eprintln!("Queries: {n_queries}");
         let n_hash = idx.n_hash;
-        eprintln!("k={k}, n_hash={n_hash}, min_shared={min_shared}, top_k={top_k}");
+        let n_hash_search = if n_hash_search == 0 { n_hash } else { n_hash_search };
+        eprintln!("k={k}, n_hash={n_hash}, n_hash_search={n_hash_search}, min_shared={min_shared}, top_k={top_k}");
 
         let dh = Arc::clone(&dayhoff);
         let query_sketches: Vec<Vec<u32>> = query_seqs.par_iter()
@@ -386,7 +391,7 @@ fn main() {
             .collect();
 
         let t1 = Instant::now();
-        let results = search_v2(&idx, &query_sketches, min_shared, top_k);
+        let results = search_v2(&idx, &query_sketches, min_shared, top_k, n_hash_search);
         let t_search = t1.elapsed().as_secs_f64();
         eprintln!("Search: {n_queries} queries in {t_search:.3}s  ({:.0} q/s)",
                   n_queries as f64 / t_search);
@@ -419,7 +424,8 @@ fn main() {
         };
 
         eprintln!("Queries: {n_queries}");
-        eprintln!("k={k}, n_hash={n_hash}, min_shared={min_shared}, top_k={top_k}");
+        let n_hash_search = if n_hash_search == 0 { n_hash } else { n_hash_search };
+        eprintln!("k={k}, n_hash={n_hash}, n_hash_search={n_hash_search}, min_shared={min_shared}, top_k={top_k}");
 
         let dh = Arc::clone(&dayhoff);
         let query_sketches: Vec<Vec<u32>> = query_seqs.par_iter()
@@ -429,7 +435,7 @@ fn main() {
         let t1 = Instant::now();
         let inv = Arc::new(inv);
         let ids = Arc::new(db_ids);
-        let results = search_eager(&inv, &query_sketches, min_shared, top_k);
+        let results = search_eager(&inv, &query_sketches, min_shared, top_k, n_hash_search);
         let t_search = t1.elapsed().as_secs_f64();
         eprintln!("Search: {n_queries} queries in {t_search:.3}s  ({:.0} q/s)",
                   n_queries as f64 / t_search);

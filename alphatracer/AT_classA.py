@@ -59,10 +59,10 @@ def parse_args():
     )
     p.add_argument('-i', '--input', required=True,
                    help='Input FASTA of query protein sequences')
-    _afdb_dir = os.environ.get('AT_AFDB_DIR', os.path.expanduser('~/Science/Data/AFDB'))
+    _afdb_dir = os.environ.get('AT_AFDB_DIR', os.getcwd())
     p.add_argument('-d', '--database',
                    default=os.path.join(_afdb_dir, 'bacarc8080.dmnd'),
-                   help='DIAMOND database (default: $AT_AFDB_DIR/bacarc8080.dmnd)')
+                   help='DIAMOND database (default: $AT_AFDB_DIR/bacarc8080.dmnd or cwd)')
     p.add_argument('-t', '--threads', type=int, default=4,
                    help='CPU threads for DIAMOND and parallel downloads')
     p.add_argument('--window-size', type=int, default=40,
@@ -384,16 +384,36 @@ def stage_download(classA_df: pl.DataFrame, pdb_dir: str, threads: int):
                 os.remove(path)
             return f'failed:{afdb_id}:{e}'
 
-    with ThreadPoolExecutor(max_workers=min(32, len(afdb_ids))) as ex:
-        results = list(ex.map(_fetch, list(afdb_ids)))
+    # ── first pass (threaded) ──────────────────────────────────────────────
+    afdb_list = list(afdb_ids)
+    with ThreadPoolExecutor(max_workers=min(32, len(afdb_list))) as ex:
+        futures = {ex.submit(_fetch, aid): aid for aid in afdb_list}
+        results = {}
+        for fut in as_completed(futures):
+            aid = futures[fut]
+            r = fut.result()
+            results[aid] = r
+            if r.startswith('fail'):
+                time.sleep(0.5)
 
-    summary = Counter(r.split(':')[0] for r in results)
-    for r in results:
-        if r.startswith('failed'):
+    # ── retry failures ─────────────────────────────────────────────────────
+    retry = [aid for aid, r in results.items() if r.startswith('fail')]
+    if retry:
+        print(f'  Retrying {len(retry)} failed download(s)...')
+        for aid in retry:
+            r = _fetch(aid)
+            results[aid] = r
+            if r.startswith('fail'):
+                time.sleep(0.5)
+
+    all_results = list(results.values())
+    summary = Counter(r.split(':')[0] for r in all_results)
+    for r in all_results:
+        if r.startswith('fail'):
             print(f'  FAILED: {r}')
     print(f"  Downloaded: {summary['downloaded']}  "
           f"Already present: {summary['exists']}  "
-          f"Failed: {summary['failed']}")
+          f"Failed: {summary.get('failed', 0) + summary.get('fail', 0)}")
 
 
 # ── Stage 5: build output PDBs ─────────────────────────────────────────────────

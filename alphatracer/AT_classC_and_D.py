@@ -41,7 +41,7 @@ import json
 import gzip
 import argparse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -214,14 +214,33 @@ def stage_download_pae(afdb_ids, pae_dir, threads):
                 os.remove(path)
             return f'fail:{afdb_id}:{e}'
 
+    # ── first pass (threaded) ──────────────────────────────────────────────
     with ThreadPoolExecutor(max_workers=min(32, len(missing))) as ex:
-        results = list(ex.map(_fetch, missing))
+        futures = {ex.submit(_fetch, aid): aid for aid in missing}
+        results = {}
+        for fut in as_completed(futures):
+            aid = futures[fut]
+            r = fut.result()
+            results[aid] = r
+            if r.startswith('fail'):
+                time.sleep(0.5)
 
-    n_ok = sum(1 for r in results if r.startswith('ok'))
-    for r in results:
+    # ── retry failures ─────────────────────────────────────────────────────
+    retry = [aid for aid, r in results.items() if r.startswith('fail')]
+    if retry:
+        print(f'  Retrying {len(retry)} failed PAE download(s)...')
+        for aid in retry:
+            r = _fetch(aid)
+            results[aid] = r
+            if r.startswith('fail'):
+                time.sleep(0.5)
+
+    all_results = list(results.values())
+    n_ok = sum(1 for r in all_results if r.startswith('ok'))
+    for r in all_results:
         if r.startswith('fail'):
             print(f'  PAE FAILED: {r}')
-    print(f'  Downloaded: {n_ok}  Failed: {len(missing) - n_ok}')
+    print(f'  Downloaded: {n_ok}  Failed: {len(all_results) - n_ok}')
 
 
 def _load_pae_matrix(pae_path):
@@ -1359,14 +1378,14 @@ def main():
 
     # ── Load hits ─────────────────────────────────────────────────────────────
     hits_df = None
-    for fname in ['allhits.pq', 'tophits.pq']:
+    for fname in ['allhits.pq', 'tophits.pq', 'kmer_hits.pq']:
         p = os.path.join(indir, fname)
         if os.path.exists(p):
             hits_df = pl.read_parquet(p)
             print(f'Loaded {fname}: {len(hits_df)} rows')
             break
     if hits_df is None:
-        sys.exit(f'No allhits.pq/tophits.pq in {indir}')
+        sys.exit(f'No allhits.pq/tophits.pq/kmer_hits.pq in {indir}')
 
     classA_path = os.path.join(indir, 'classA.pq')
     if not os.path.exists(classA_path):
@@ -1378,15 +1397,18 @@ def main():
                    if os.path.exists(classB_path) else set())
 
     # ── [C-1] Alignment ───────────────────────────────────────────────────────
+    exclude_ids = classA_ids | classB_ids
     candidates = (
         hits_df
         .filter(pl.col('approx_pident') >= args.min_pctsim)
-        .filter(~pl.col('qseqid').is_in(classA_ids))
+        .filter(~pl.col('qseqid').is_in(exclude_ids))
         .sort('approx_pident', descending=True)
         .group_by('qseqid', maintain_order=True)
         .agg(pl.all().first())
     )
-    print(f'{len(classA_ids)} Class A excluded  |  {len(candidates)} candidates for Class C')
+    print(f'{len(classA_ids)} Class A + {len(classB_ids)} Class B excluded  |  {len(candidates)} candidates for Class C')
+    with open(os.path.join(indir, '.classC_total'), 'w') as _f:
+        _f.write(str(len(candidates)))
 
     if args.limit > 0:
         candidates = candidates.head(args.limit)
@@ -1653,6 +1675,8 @@ def main():
         print(f'  Forwarded to D:   {n_forwarded}  '
               f'(A failures={len(failed_A)}, B={len(failed_B)}, C={len(failed_C)})')
     print(f'  Class D:          {len(classD_seqs)}')
+    with open(os.path.join(indir, '.classD_total'), 'w') as _f:
+        _f.write(str(len(classD_seqs)))
 
     if not classD_seqs:
         print('  No Class D sequences.')

@@ -30,12 +30,16 @@ Usage
   # Class D de-novo only (no Class A/B/C):
   python run_alphatracer.py -i proteins.fasta \\
       --skip-classA --skip-classB --skip-classC
+
+  # Show full verbose output instead of progress bar:
+  python run_alphatracer.py -i proteins.fasta --verbose
 """
 
 import argparse
 import os
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -47,34 +51,157 @@ _PKG_PARENT = str(_HERE.parent)              # repo root — added to PYTHONPATH
 
 
 def _script(name: str) -> str:
-    """Return the absolute path to a component script in the same directory."""
     return str(_HERE / name)
 
 
+def _make_env(extra: dict | None = None) -> dict:
+    env = {**os.environ, **(extra or {})}
+    existing = env.get('PYTHONPATH', '')
+    env['PYTHONPATH'] = _PKG_PARENT + (os.pathsep + existing if existing else '')
+    return env
+
+
 def _run(cmd: list[str], label: str, extra_env: dict | None = None) -> None:
-    """Run a subprocess command, printing a header and raising on failure."""
+    """Verbose mode: print header + stream subprocess output."""
     print()
     print('=' * 60)
     print(f'  AlphaTracer  ►  {label}')
     print('  Command: ' + ' '.join(cmd))
     print('=' * 60)
-    env = {**os.environ, **(extra_env or {})}
-    # Ensure the repo root is on PYTHONPATH so subprocesses find the alphatracer package.
-    existing = env.get('PYTHONPATH', '')
-    env['PYTHONPATH'] = _PKG_PARENT + (os.pathsep + existing if existing else '')
-    result = subprocess.run(cmd, env=env)
+    result = subprocess.run(cmd, env=_make_env(extra_env))
     if result.returncode != 0:
         sys.exit(f'\n[FATAL] {label} exited with code {result.returncode}. Aborting.')
 
 
+def _run_quiet(cmd: list[str], label: str, log_path: str,
+               extra_env: dict | None = None) -> None:
+    """Quiet mode: capture output to log file, raise on failure."""
+    with open(log_path, 'a') as lf:
+        lf.write(f'\n{"=" * 60}\n  {label}\n{"=" * 60}\n')
+        lf.write('  Command: ' + ' '.join(cmd) + '\n\n')
+        result = subprocess.run(cmd, env=_make_env(extra_env), stdout=lf, stderr=lf)
+    if result.returncode != 0:
+        sys.stdout.write('\n')
+        sys.exit(
+            f'\n[FATAL] {label} exited with code {result.returncode}.\n'
+            f'        See {log_path} for details. Aborting.'
+        )
+
+
 def _flag(name: str, value) -> list[str]:
-    """Return [--name, str(value)] if value is truthy, else []."""
     return [name, str(value)] if value else []
 
 
 def _bool_flag(name: str, enabled: bool) -> list[str]:
-    """Return [name] if enabled, else []."""
     return [name] if enabled else []
+
+
+# ── Progress bar ───────────────────────────────────────────────────────────────
+
+def _count_pdbs(path: str) -> int:
+    try:
+        return sum(1 for e in os.scandir(path) if e.name.endswith('.pdb'))
+    except (FileNotFoundError, NotADirectoryError):
+        return 0
+
+
+def _count_fasta(path: str) -> int:
+    try:
+        with open(path) as f:
+            return sum(1 for line in f if line.startswith('>'))
+    except Exception:
+        return 0
+
+
+class _StatusBar:
+    """Single updating status line shown during quiet-mode execution."""
+
+    _BAR_WIDTH = 28
+
+    def __init__(self, proc_dir: str, total: int, log_path: str):
+        self.proc_dir  = proc_dir
+        self.total     = total
+        self.log_path  = log_path
+        self._phase    = 'Starting...'
+        self._stop     = threading.Event()
+        self._lock     = threading.Lock()
+        self._thread   = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self) -> '_StatusBar':
+        self._thread.start()
+        return self
+
+    def phase(self, label: str) -> None:
+        with self._lock:
+            self._phase = label
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=2)
+        self._draw(final=True)
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _read_total_file(self, cls: str) -> int | None:
+        """Read .classX_total written by the subprocess once its candidate count is known."""
+        try:
+            with open(os.path.join(self.proc_dir, f'.class{cls}_total')) as f:
+                return int(f.read().strip())
+        except Exception:
+            return None
+
+    def _class_A_total(self) -> int | None:
+        """Class A total from classA.pq written after kmer-classify phase."""
+        try:
+            import polars as pl
+            pq = os.path.join(self.proc_dir, 'classA.pq')
+            return pl.read_parquet(pq)['qseqid'].n_unique()
+        except Exception:
+            return None
+
+    def _class_counts(self) -> dict[str, tuple[int, int | None]]:
+        """Returns {cls: (done, total_or_None)} for each class."""
+        result = {}
+        for cls in ('A', 'B', 'C', 'D'):
+            done = _count_pdbs(os.path.join(self.proc_dir, f'output_pdbs_class{cls}'))
+            if cls == 'A':
+                total = self._class_A_total()
+            else:
+                total = self._read_total_file(cls)
+            result[cls] = (done, total)
+        return result
+
+    def _draw(self, final: bool = False) -> None:
+        counts = self._class_counts()
+        done   = sum(d for d, _ in counts.values())
+        total  = self.total
+        pct    = done / max(total, 1)
+        w      = self._BAR_WIDTH
+        filled = int(w * pct)
+        bar    = '█' * filled + '░' * (w - filled)
+
+        with self._lock:
+            phase = self._phase
+
+        active = [(k, d, t) for k, (d, t) in counts.items() if d > 0]
+        if active:
+            parts = []
+            for k, d, t in active:
+                parts.append(f'Class {k}: {d}/{t}' if t is not None else f'Class {k}: {d}')
+            detail = '  '.join(parts)
+        else:
+            detail = phase
+
+        if final:
+            line = f'\r  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  Done{" " * 35}\n'
+        else:
+            line = f'\r  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  {detail}{" " * 10}'
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(0.5):
+            self._draw()
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
@@ -91,6 +218,11 @@ def parse_args() -> argparse.Namespace:
         '-i', '--input', required=True,
         help='Input FASTA of query protein sequences',
     )
+    p.add_argument(
+        '--dbdir', default=None, metavar='DIR',
+        help='Directory containing AFDB parquet and sketch index '
+             '(default: current working directory)',
+    )
 
     # ── Shared ────────────────────────────────────────────────────────────────
     shared = p.add_argument_group('shared options (forwarded to all relevant scripts)')
@@ -99,9 +231,9 @@ def parse_args() -> argparse.Namespace:
         help='Use DIAMOND blastp for Class A search instead of kmer sketch (default: kmer)',
     )
     shared.add_argument(
-        '-d', '--database',
-        default=os.path.expanduser('~/Science/Data/AFDB/afdb_v6_reps.dmnd'),
-        help='DIAMOND database for Class A (only used with --diamond)',
+        '-d', '--database', default=None,
+        help='DIAMOND database for Class A (only used with --diamond; '
+             'default: bacarc8080.dmnd in --dbdir)',
     )
     shared.add_argument('--top-k', type=int, default=5,
                         help='Hits per query from kmer search (default: 5)')
@@ -211,6 +343,11 @@ def parse_args() -> argparse.Namespace:
                       help='Python interpreter for Class C/D script '
                            '(defaults to --python; use the miniscaffold venv '
                            'if MLX/OFS are not in the main env)')
+    ctrl.add_argument('--outdir', default=None, metavar='DIR',
+                      help='Processing directory to use or resume '
+                           '(default: AT_processing_{input stem} in current directory)')
+    ctrl.add_argument('--verbose', action='store_true', default=False,
+                      help='Print full output from each stage instead of a progress bar')
 
     return p.parse_args()
 
@@ -220,21 +357,32 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
+    # Resolve dbdir and propagate to all subprocesses via AT_AFDB_DIR.
+    dbdir = os.path.abspath(args.dbdir) if args.dbdir else os.getcwd()
+    os.environ['AT_AFDB_DIR'] = dbdir
+
+    # Resolve DIAMOND database path (only used with --diamond).
+    if args.database is None:
+        args.database = os.path.join(dbdir, 'bacarc8080.dmnd')
+
     input_path   = Path(args.input)
-    proc_dir     = f'AT_processing_{input_path.stem}'
+    proc_dir     = os.path.abspath(args.outdir) if args.outdir else f'AT_processing_{input_path.stem}'
     py_main      = args.python
     py_cd        = args.classcd_python or py_main
+    verbose      = args.verbose
+    log_path     = os.path.join(proc_dir, 'alphatracer.log')
+
+    total_seqs   = _count_fasta(args.input)
 
     print('=' * 60)
     print('AlphaTracer  —  Full Pipeline Wrapper')
     print('=' * 60)
     search_method = 'diamond' if args.diamond else 'kmer'
-    # When using kmer, min_pctsim thresholds are lowered to 1 because approx_pident
-    # = shared hash count (already pre-filtered by the kmer index).
-    b_min_pctsim = args.b_min_pctsim if args.diamond else 1
-    c_min_pctsim = args.c_min_pctsim if args.diamond else 1
+    b_min_pctsim  = args.b_min_pctsim if args.diamond else 1
+    c_min_pctsim  = args.c_min_pctsim if args.diamond else 1
 
-    print(f'  Input:        {args.input}')
+    print(f'  Input:        {args.input}  ({total_seqs} sequences)')
+    print(f'  DB dir:       {dbdir}')
     print(f'  Processing:   {proc_dir}/')
     print(f'  Search:       {search_method}')
     print(f'  Python (A/B): {py_main}')
@@ -245,6 +393,8 @@ def main() -> None:
                               ('C', args.skip_classC)] if s]
     skips += (['D'] if args.no_classD else [])
     print(f'  Skip:         {", ".join(skips) or "none"}')
+    if not verbose:
+        print(f'  Log:          {log_path}')
     print()
 
     # ── ProMod3 database setup ─────────────────────────────────────────────────
@@ -254,10 +404,23 @@ def main() -> None:
             data_dir=args.promod3_data_dir, verbose=True)
         os.environ['PROMOD3_SHARED_DATA_PATH'] = str(data_dir)
 
+    # ── Set up quiet-mode progress bar ────────────────────────────────────────
+    bar: _StatusBar | None = None
+    if not verbose:
+        os.makedirs(proc_dir, exist_ok=True)
+        bar = _StatusBar(proc_dir, total_seqs, log_path).start()
+
+    def run(cmd, label, extra_env=None):
+        if verbose:
+            _run(cmd, label, extra_env)
+        else:
+            _run_quiet(cmd, label, log_path, extra_env)
+
     # ── Class A ───────────────────────────────────────────────────────────────
     if not args.skip_classA:
         if args.diamond:
-            # DIAMOND: single blocking call (no classify/download split)
+            if bar:
+                bar.phase('Class A: searching (DIAMOND)...')
             cmd_a = [
                 py_main, _script('AT_classA.py'),
                 '-i', args.input,
@@ -266,9 +429,11 @@ def main() -> None:
                 '--window-size', str(args.window_size),
                 '--pctsim',      str(args.pctsim),
             ]
-            _run(cmd_a, f'Class A ({search_method})')
-            # Then run Class B normally below
+            run(cmd_a, f'Class A ({search_method})')
+
             if not args.skip_classB:
+                if bar:
+                    bar.phase('Class B: rebuilding loops...')
                 cmd_b = [
                     py_main, _script('AT_classB.py'),
                     '-i', proc_dir,
@@ -284,11 +449,14 @@ def main() -> None:
                     *_flag('--promod3-data-dir', args.promod3_data_dir),
                     *_flag('--limit', args.b_limit),
                 ]
-                _run(cmd_b, 'Class B')
+                run(cmd_b, 'Class B')
             else:
-                print('[SKIP] Class B')
+                if verbose:
+                    print('[SKIP] Class B')
         else:
             # kmer: Phase 1 — classify only (~10s), writes classA.pq
+            if bar:
+                bar.phase('Class A: kmer search...')
             cmd_a_classify = [
                 py_main, _script('AT_classA_kmer.py'),
                 '-i', args.input,
@@ -299,9 +467,9 @@ def main() -> None:
                 '--outdir',        proc_dir,
                 '--classify-only',
             ]
-            _run(cmd_a_classify, 'Class A — classify (kmer)')
+            run(cmd_a_classify, 'Class A — classify (kmer)')
 
-            # Phase 2 — run A download+build concurrently with full Class B
+            # Phase 2 — A download+build concurrently with full Class B
             cmd_a_dl = [
                 py_main, _script('AT_classA_kmer.py'),
                 '-i', args.input,
@@ -329,30 +497,51 @@ def main() -> None:
                     *_flag('--promod3-data-dir', args.promod3_data_dir),
                     *_flag('--limit', args.b_limit),
                 ]
-                print()
-                print('=' * 60)
-                print('  AlphaTracer  ►  Class A download + Class B  [concurrent]')
-                print('=' * 60)
 
-                def _run_silent(cmd, label):
-                    env = {**os.environ}
-                    result = subprocess.run(cmd, env=env)
+                if verbose:
+                    print()
+                    print('=' * 60)
+                    print('  AlphaTracer  ►  Class A download + Class B  [concurrent]')
+                    print('=' * 60)
+                else:
+                    bar.phase('Class A + B (concurrent)...')
+
+                def _run_sub(cmd, label):
+                    env = _make_env()
+                    if verbose:
+                        result = subprocess.run(cmd, env=env)
+                    else:
+                        with open(log_path, 'a') as lf:
+                            lf.write(f'\n=== {label} ===\n')
+                            result = subprocess.run(cmd, env=env, stdout=lf, stderr=lf)
                     if result.returncode != 0:
-                        sys.exit(f'\n[FATAL] {label} exited with code {result.returncode}. Aborting.')
+                        if not verbose:
+                            sys.stdout.write('\n')
+                        msg = f'\n[FATAL] {label} exited with code {result.returncode}.'
+                        if not verbose:
+                            msg += f'\n        See {log_path} for details.'
+                        sys.exit(msg + ' Aborting.')
 
                 with ThreadPoolExecutor(max_workers=2) as ex:
-                    fut_a = ex.submit(_run_silent, cmd_a_dl, 'Class A download+build')
-                    fut_b = ex.submit(_run_silent, cmd_b, 'Class B')
+                    fut_a = ex.submit(_run_sub, cmd_a_dl, 'Class A download+build')
+                    fut_b = ex.submit(_run_sub, cmd_b, 'Class B')
                     for fut in as_completed([fut_a, fut_b]):
-                        fut.result()  # re-raise any exception
-                print('  [concurrent phase complete]')
+                        fut.result()
+
+                if verbose:
+                    print('  [concurrent phase complete]')
             else:
-                _run(cmd_a_dl, 'Class A — download+build (kmer)')
-                print('[SKIP] Class B')
+                if bar:
+                    bar.phase('Class A: downloading & building...')
+                run(cmd_a_dl, 'Class A — download+build (kmer)')
+                if verbose:
+                    print('[SKIP] Class B')
     else:
-        print(f'[SKIP] Class A  (using existing {proc_dir}/)')
-        # ── Class B (standalone, A was skipped) ───────────────────────────────
+        if verbose:
+            print(f'[SKIP] Class A  (using existing {proc_dir}/)')
         if not args.skip_classB:
+            if bar:
+                bar.phase('Class B: rebuilding loops...')
             cmd_b = [
                 py_main, _script('AT_classB.py'),
                 '-i', proc_dir,
@@ -368,12 +557,15 @@ def main() -> None:
                 *_flag('--promod3-data-dir', args.promod3_data_dir),
                 *_flag('--limit', args.b_limit),
             ]
-            _run(cmd_b, 'Class B')
+            run(cmd_b, 'Class B')
         else:
-            print('[SKIP] Class B')
+            if verbose:
+                print('[SKIP] Class B')
 
     # ── Class C + D ───────────────────────────────────────────────────────────
     if not args.skip_classC:
+        if bar:
+            bar.phase('Class C + D...')
         cmd_cd = [
             py_cd, _script('AT_classC_and_D.py'),
             '-i', proc_dir,
@@ -406,14 +598,21 @@ def main() -> None:
             *_bool_flag('--fill-missing', args.fill_missing),
             *_bool_flag('--no-classD',    args.no_classD),
         ]
-        _run(cmd_cd, 'Class C + D', extra_env={'KMP_DUPLICATE_LIB_OK': 'TRUE'})
+        run(cmd_cd, 'Class C + D', extra_env={'KMP_DUPLICATE_LIB_OK': 'TRUE'})
     else:
-        print('[SKIP] Class C/D')
+        if verbose:
+            print('[SKIP] Class C/D')
+
+    # ── Done ──────────────────────────────────────────────────────────────────
+    if bar:
+        bar.stop()
 
     print()
     print('=' * 60)
     print('AlphaTracer  —  Pipeline complete.')
     print(f'  Output directory: {proc_dir}/')
+    if not verbose:
+        print(f'  Full log:         {log_path}')
     print('=' * 60)
 
 

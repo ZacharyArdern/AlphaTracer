@@ -26,7 +26,7 @@ import sys
 import time
 import argparse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import polars as pl
@@ -863,13 +863,33 @@ def stage_download(afdb_ids, pdb_dir, threads):
             if os.path.exists(path): os.remove(path)
             return f'fail:{afdb_id}:{e}'
 
+    # ── first pass (threaded) ──────────────────────────────────────────────
     with ThreadPoolExecutor(max_workers=min(32, len(missing))) as ex:
-        results = list(ex.map(_fetch, missing))
+        futures = {ex.submit(_fetch, aid): aid for aid in missing}
+        results = {}
+        for fut in as_completed(futures):
+            aid = futures[fut]
+            r = fut.result()
+            results[aid] = r
+            if r.startswith('fail'):
+                time.sleep(0.5)
 
-    n_ok = sum(1 for r in results if r.startswith('ok'))
-    for r in results:
-        if r.startswith('fail'): print(f'  FAILED: {r}')
-    print(f'  Downloaded: {n_ok}  Failed: {len(missing)-n_ok}')
+    # ── retry failures ─────────────────────────────────────────────────────
+    retry = [aid for aid, r in results.items() if r.startswith('fail')]
+    if retry:
+        print(f'  Retrying {len(retry)} failed download(s)...')
+        for aid in retry:
+            r = _fetch(aid)
+            results[aid] = r
+            if r.startswith('fail'):
+                time.sleep(0.5)
+
+    all_results = list(results.values())
+    n_ok = sum(1 for r in all_results if r.startswith('ok'))
+    for r in all_results:
+        if r.startswith('fail'):
+            print(f'  FAILED: {r}')
+    print(f'  Downloaded: {n_ok}  Failed: {len(all_results) - n_ok}')
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -964,6 +984,9 @@ def main():
     print(f'  {len(classB_df)} / {len(non_classA)} qualify as Class B')
     for (ni, nd), c in sorted(ins_counts.items()):
         print(f'    {ni} insertion(s) + {nd} deletion(s): {c}')
+
+    with open(os.path.join(indir, '.classB_total'), 'w') as _f:
+        _f.write(str(len(classB_df)))
 
     if len(classB_df) == 0:
         print('No Class B sequences.'); return

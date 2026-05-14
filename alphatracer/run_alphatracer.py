@@ -133,7 +133,12 @@ class _StatusBar:
 
     def phase(self, label: str) -> None:
         with self._lock:
+            if self._phase == label:
+                return
             self._phase = label
+        # Clear the current \r bar line, then print the phase as a permanent line.
+        sys.stdout.write(f'\r{" " * 90}\r  {label}\n')
+        sys.stdout.flush()
 
     def stop(self) -> None:
         self._stop.set()
@@ -420,7 +425,7 @@ def main() -> None:
     if not args.skip_classA:
         if args.diamond:
             if bar:
-                bar.phase('Class A: searching (DIAMOND)...')
+                bar.phase('Searching for Class A sequences (DIAMOND)...')
             cmd_a = [
                 py_main, _script('AT_classA.py'),
                 '-i', args.input,
@@ -433,7 +438,7 @@ def main() -> None:
 
             if not args.skip_classB:
                 if bar:
-                    bar.phase('Class B: rebuilding loops...')
+                    bar.phase('Building Class B structures...')
                 cmd_b = [
                     py_main, _script('AT_classB.py'),
                     '-i', proc_dir,
@@ -456,7 +461,7 @@ def main() -> None:
         else:
             # kmer: Phase 1 — classify only (~10s), writes classA.pq
             if bar:
-                bar.phase('Class A: kmer search...')
+                bar.phase('Searching for Class A sequences (kmer)...')
             cmd_a_classify = [
                 py_main, _script('AT_classA_kmer.py'),
                 '-i', args.input,
@@ -504,7 +509,7 @@ def main() -> None:
                     print('  AlphaTracer  ►  Class A download + Class B  [concurrent]')
                     print('=' * 60)
                 else:
-                    bar.phase('Class A + B (concurrent)...')
+                    bar.phase('Building Class A and Class B structures...')
 
                 def _run_sub(cmd, label):
                     env = _make_env()
@@ -532,7 +537,7 @@ def main() -> None:
                     print('  [concurrent phase complete]')
             else:
                 if bar:
-                    bar.phase('Class A: downloading & building...')
+                    bar.phase('Building Class A structures...')
                 run(cmd_a_dl, 'Class A — download+build (kmer)')
                 if verbose:
                     print('[SKIP] Class B')
@@ -541,7 +546,7 @@ def main() -> None:
             print(f'[SKIP] Class A  (using existing {proc_dir}/)')
         if not args.skip_classB:
             if bar:
-                bar.phase('Class B: rebuilding loops...')
+                bar.phase('Building Class B structures...')
             cmd_b = [
                 py_main, _script('AT_classB.py'),
                 '-i', proc_dir,
@@ -565,7 +570,7 @@ def main() -> None:
     # ── Class C + D ───────────────────────────────────────────────────────────
     if not args.skip_classC:
         if bar:
-            bar.phase('Class C + D...')
+            bar.phase('Building Class C and D structures...')
         cmd_cd = [
             py_cd, _script('AT_classC_and_D.py'),
             '-i', proc_dir,

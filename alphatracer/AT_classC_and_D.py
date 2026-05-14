@@ -1528,7 +1528,7 @@ def main():
         if ref_poly is None:
             src_pdb = _A.afdb_local_pdb(afdb_id, pdb_dir)
             if not os.path.exists(src_pdb):
-                _A._fetch_pdb(afdb_id, pdb_dir)
+                _B.stage_download({afdb_id}, pdb_dir, 1)
             if os.path.exists(src_pdb):
                 st = gemmi.read_structure(src_pdb)
                 ref_poly = [r for r in st[0]['A']

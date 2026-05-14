@@ -316,6 +316,10 @@ def parse_args() -> argparse.Namespace:
                         help='Resolution for reference proteins >--large-domain-threshold aa')
     grp_cd.add_argument('--large-domain-threshold', type=int, default=500,
                         help='Reference length above which --pae-resolution-large is used')
+    grp_cd.add_argument('--min-domain-size', type=int, default=30,
+                        help='Minimum domain residue count for Class C (default: 30)')
+    grp_cd.add_argument('--min-domain-plddt', type=float, default=70.0,
+                        help='Minimum mean AF pLDDT over domain for Class C (default: 70)')
     grp_cd.add_argument('--c-limit', type=int, default=0,
                         help='Limit Class C to first N sequences (0=all)')
     grp_cd.add_argument('--fill-missing', action='store_true', default=False,
@@ -601,6 +605,8 @@ def main() -> None:
             '--pae-resolution',         str(args.pae_resolution),
             '--pae-resolution-large',   str(args.pae_resolution_large),
             '--large-domain-threshold', str(args.large_domain_threshold),
+            '--min-domain-size',        str(args.min_domain_size),
+            '--min-domain-plddt',       str(args.min_domain_plddt),
             '--mm-iters',               str(args.mm_iters_C),
             '--ccd-iters',              str(args.ccd_iters),
             '--ccd-tol',                str(args.ccd_tol),

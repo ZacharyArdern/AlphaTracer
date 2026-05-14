@@ -153,6 +153,10 @@ def parse_args():
                    help='graph_resolution for domains >--large-domain-threshold aa (default: 2.0)')
     p.add_argument('--large-domain-threshold', type=int, default=500,
                    help='Residue count above which --pae-resolution-large is used (default: 500)')
+    p.add_argument('--min-domain-size',      type=int,   default=30,
+                   help='Minimum domain residue count for Class C; smaller domains go to Class D (default: 30)')
+    p.add_argument('--min-domain-plddt',     type=float, default=70.0,
+                   help='Minimum mean AF pLDDT over domain residues for Class C; low-confidence domains go to Class D (default: 70)')
     p.add_argument('--mm-iters',            type=int,   default=300)
     p.add_argument('--ccd-iters',           type=int,   default=200)
     p.add_argument('--ccd-tol',             type=float, default=0.15)
@@ -1510,6 +1514,19 @@ def main():
         if not qualifying:
             return None, 'no_domain'
         best = max(qualifying, key=len)
+
+        if len(best) < args.min_domain_size:
+            return None, 'domain_too_small'
+
+        plddt_vals = []
+        for pos in best:
+            if pos < len(ref_poly):
+                ca = ref_poly[pos].find_atom('CA', '\0')
+                if ca:
+                    plddt_vals.append(ca.b_iso)
+        if plddt_vals and (sum(plddt_vals) / len(plddt_vals)) < args.min_domain_plddt:
+            return None, 'domain_low_plddt'
+
         return {**row, '_best_domain': best}, 'ok'
 
     rows_list = list(merged.iter_rows(named=True))
@@ -1517,7 +1534,7 @@ def main():
         qual_results = list(ex.map(_qualify_one, rows_list))
 
     classC_rows = []
-    n_qualify = n_no_pae = n_no_domain = 0
+    n_qualify = n_no_pae = n_no_domain = n_too_small = n_low_plddt = 0
     for result_row, status in qual_results:
         if status == 'ok':
             classC_rows.append(result_row)
@@ -1526,10 +1543,18 @@ def main():
             n_no_pae += 1
         elif status == 'no_domain':
             n_no_domain += 1
+        elif status == 'domain_too_small':
+            n_too_small += 1
+        elif status == 'domain_low_plddt':
+            n_low_plddt += 1
 
-    print(f'  Qualifying:    {n_qualify}')
-    print(f'  No PAE file:   {n_no_pae}')
-    print(f'  No domain:     {n_no_domain}')
+    print(f'  Qualifying:         {n_qualify}')
+    print(f'  No PAE file:        {n_no_pae}')
+    print(f'  No domain:          {n_no_domain}')
+    if n_too_small:
+        print(f'  Domain too small:   {n_too_small}  (<{args.min_domain_size} residues → Class D)')
+    if n_low_plddt:
+        print(f'  Domain low pLDDT:   {n_low_plddt}  (<{args.min_domain_plddt:.0f} mean → Class D)')
 
     classC_ids = {r['qseqid'] for r in classC_rows}
 

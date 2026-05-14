@@ -1753,7 +1753,6 @@ def main():
     plddt_thresh  = args.plddt_threshold
     max_global_r  = args.max_recyclings
 
-    results_map   = {}   # seq_id → (pdb_str, mean_plddt, r_used, elapsed_s)
     still_pending = pending   # list of (seq_id, seq, max_r)
     done_count    = 0
 
@@ -1794,56 +1793,48 @@ def main():
             print(f'  Batch {b_idx}/{len(batches)}  B={len(batch)}  '
                   f'lens={lens_in_batch}  recyclings={r}', flush=True)
             t_batch = time.perf_counter()
+            elapsed_per = 0.0
             try:
                 batch_results = _fold_predict_batch(
                     [(sid, seq) for sid, seq, _ in batch], r)
-                elapsed_batch = time.perf_counter() - t_batch
+                elapsed_per = (time.perf_counter() - t_batch) / len(batch)
                 for (seq_id, pdb_str, mean_plddt), (_, seq, max_r) in zip(batch_results, batch):
                     done_count += 1
                     print(f'    [{done_count}/{len(pending)}] {seq_id}  '
                           f'len={len(seq)}  plddt={mean_plddt:.2f}  r={r}',
                           flush=True)
                     if mean_plddt >= plddt_thresh or r >= max_r:
+                        out_pdb = os.path.join(outdir_D, f'classD:{seq_id}.pdb')
                         pdb_str = _restore_selenocysteine(pdb_str, sec_pos_map.get(seq_id, []))
-                        results_map[seq_id] = (pdb_str, mean_plddt, r,
-                                               elapsed_batch / len(batch))
+                        with open(out_pdb, 'w') as fh:
+                            fh.write(pdb_str)
+                        n_ok_D += 1
+                        timings_D.append(elapsed_per)
+                        D_rows.append({
+                            'query_id':   seq_id,
+                            'len':        len(seq),
+                            'status':     'ok',
+                            'pdb':        out_pdb,
+                            'recyclings': str(r),
+                            'plddt':      f'{mean_plddt:.2f}',
+                            'elapsed_s':  f'{elapsed_per:.1f}',
+                        })
                     else:
                         next_pending.append((seq_id, seq, max_r))
                         done_count -= 1   # will be counted again next round
             except Exception as exc:
                 _tb.print_exc()
-                elapsed_batch = time.perf_counter() - t_batch
+                elapsed_per = (time.perf_counter() - t_batch) / max(len(batch), 1)
                 print(f'  Batch FAILED: {exc}', flush=True)
-                for seq_id, seq, max_r in batch:
-                    results_map[seq_id] = (None, 0.0, r, elapsed_batch / len(batch))
+                for seq_id, seq, _ in batch:
+                    n_fail_D += 1
+                    D_rows.append({
+                        'query_id': seq_id, 'len': len(seq), 'status': 'failed',
+                        'pdb': '', 'recyclings': str(r),
+                        'plddt': '', 'elapsed_s': f'{elapsed_per:.1f}',
+                    })
 
         still_pending = next_pending
-
-    # Write all results
-    for seq_id, (pdb_str, mean_plddt, r_used, elapsed_s) in results_map.items():
-        seq = classD_seqs[seq_id]
-        out_pdb = os.path.join(outdir_D, f'classD:{seq_id}.pdb')
-        if pdb_str is not None:
-            with open(out_pdb, 'w') as fh:
-                fh.write(pdb_str)
-            n_ok_D += 1
-            timings_D.append(elapsed_s)
-            D_rows.append({
-                'query_id':   seq_id,
-                'len':        len(seq),
-                'status':     'ok',
-                'pdb':        out_pdb,
-                'recyclings': str(r_used),
-                'plddt':      f'{mean_plddt:.2f}',
-                'elapsed_s':  f'{elapsed_s:.1f}',
-            })
-        else:
-            n_fail_D += 1
-            D_rows.append({
-                'query_id': seq_id, 'len': len(seq), 'status': 'failed',
-                'pdb': '', 'recyclings': str(r_used),
-                'plddt': '', 'elapsed_s': f'{elapsed_s:.1f}',
-            })
 
     table_D_path = os.path.join(indir, 'classD_pdb_table.tsv')
     pl.DataFrame(D_rows).write_csv(table_D_path, separator='\t')

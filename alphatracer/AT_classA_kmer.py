@@ -203,6 +203,38 @@ def afdb_local_pdb(afdb_id, pdb_dir):
     return os.path.join(pdb_dir, f'{afdb_id}-model_v{AFDB_VERSION}.pdb')
 
 
+def _is_valid_pdb(path):
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(6).decode('ascii', errors='ignore')
+        return header.strip()[:6] in ('HEADER', 'REMARK', 'ATOM  ', 'MODEL ')
+    except Exception:
+        return False
+
+
+def _fetch_pdb(afdb_id, pdb_dir):
+    path = afdb_local_pdb(afdb_id, pdb_dir)
+    filename = os.path.basename(path)
+    if os.path.exists(path) and _is_valid_pdb(path):
+        return f'exists:{filename}'
+    url = f'https://alphafold.ebi.ac.uk/files/{filename}'
+    try:
+        with open(path, 'wb') as f:
+            c = pycurl.Curl()
+            c.setopt(c.URL, url)
+            c.setopt(c.WRITEDATA, f)
+            c.perform()
+            c.close()
+        if _is_valid_pdb(path):
+            return f'downloaded:{filename}'
+        os.remove(path)
+        return f'failed:{afdb_id}:server returned non-PDB content'
+    except Exception as e:
+        if os.path.exists(path):
+            os.remove(path)
+        return f'failed:{afdb_id}:{e}'
+
+
 # ── Stage 1: filter FASTA ──────────────────────────────────────────────────────
 
 def stage_filter(input_path, output_path):
@@ -445,41 +477,11 @@ def stage_download(classA_df, pdb_dir, threads):
     print(f'  {len(afdb_ids)} unique AlphaFold accession(s) to download (v{AFDB_VERSION})',
           flush=True)
 
-    def _is_valid_pdb(path):
-        try:
-            with open(path, 'rb') as f:
-                header = f.read(6).decode('ascii', errors='ignore')
-            return header.strip()[:6] in ('HEADER', 'REMARK', 'ATOM  ', 'MODEL ')
-        except Exception:
-            return False
-
-    def _fetch(afdb_id):
-        path = afdb_local_pdb(afdb_id, pdb_dir)
-        filename = os.path.basename(path)
-        if os.path.exists(path) and _is_valid_pdb(path):
-            return f'exists:{filename}'
-        url = f'https://alphafold.ebi.ac.uk/files/{filename}'
-        try:
-            with open(path, 'wb') as f:
-                c = pycurl.Curl()
-                c.setopt(c.URL, url)
-                c.setopt(c.WRITEDATA, f)
-                c.perform()
-                c.close()
-            if _is_valid_pdb(path):
-                return f'downloaded:{filename}'
-            os.remove(path)
-            return f'failed:{afdb_id}:server returned non-PDB content'
-        except Exception as e:
-            if os.path.exists(path):
-                os.remove(path)
-            return f'failed:{afdb_id}:{e}'
-
     afdb_list = list(afdb_ids)
 
     # ── first pass (threaded) ──────────────────────────────────────────────
     with ThreadPoolExecutor(max_workers=threads) as ex:
-        futures = {ex.submit(_fetch, aid): aid for aid in afdb_list}
+        futures = {ex.submit(_fetch_pdb, aid, pdb_dir): aid for aid in afdb_list}
         results = {}
         pbar = _tqdm(as_completed(futures), total=len(afdb_list), unit="pdb") \
                if HAS_TQDM else as_completed(futures)
@@ -495,7 +497,7 @@ def stage_download(classA_df, pdb_dir, threads):
     if retry:
         print(f'  Retrying {len(retry)} failed download(s)...')
         for aid in retry:
-            r = _fetch(aid)
+            r = _fetch_pdb(aid, pdb_dir)
             results[aid] = r
             if r.startswith('fail'):
                 time.sleep(0.5)
@@ -508,6 +510,112 @@ def stage_download(classA_df, pdb_dir, threads):
     print(f"  Downloaded: {summary['downloaded']}  "
           f"Already present: {summary['exists']}  "
           f"Failed: {summary.get('failed', 0) + summary.get('fail', 0)}")
+
+
+# ── Stage 4+5: pipelined download and build ────────────────────────────────────
+
+def stage_download_and_build(classA_df, pdb_dir, output_pdbs_dir, threads):
+    """Download reference PDBs and build output PDBs in a pipelined fashion.
+
+    Each query's output PDB is built immediately after its primary reference PDB
+    download completes, so builds overlap with remaining downloads.
+    """
+    query_hits = defaultdict(list)
+    for row in classA_df.sort('approx_pident', descending=True).iter_rows(named=True):
+        query_hits[row['qseqid']].append(row)
+
+    # Map each afdb_id to the queries for which it is the primary (rank-0) hit.
+    aid_primary_queries = defaultdict(list)
+    for qseqid, hits in query_hits.items():
+        primary_aid = get_afdb_id(hits[0]['sseqid'])
+        if primary_aid:
+            aid_primary_queries[primary_aid].append(qseqid)
+
+    # All afdb_ids referenced across all hits (primary + fallbacks).
+    all_aids = set()
+    for hits in query_hits.values():
+        for row in hits:
+            aid = get_afdb_id(row['sseqid'])
+            if aid:
+                all_aids.add(aid)
+
+    print(f'  {len(all_aids)} unique AlphaFold accession(s) to download (v{AFDB_VERSION})',
+          flush=True)
+
+    built = set()
+    n_ok = n_fail = 0
+    timings = []
+
+    def _try_build_query(qseqid):
+        out_pdb = os.path.join(output_pdbs_dir, f'classA:{qseqid}.pdb')
+        if os.path.exists(out_pdb) and os.path.getsize(out_pdb) > 0:
+            return True
+        hits = query_hits[qseqid]
+        last_err = 'no hits'
+        for rank, row in enumerate(hits):
+            t0 = time.perf_counter()
+            err = _try_build_pdb(row, pdb_dir, out_pdb)
+            elapsed = time.perf_counter() - t0
+            if err is None:
+                if rank > 0:
+                    print(f'  {qseqid}: built from fallback hit {rank+1} ({row["sseqid"]})')
+                timings.append(elapsed)
+                return True
+            last_err = err
+            if rank == 0 and len(hits) > 1:
+                print(f'  {qseqid}: hit 1 failed ({err}), trying next...')
+        print(f'  {qseqid}: all {len(hits)} hit(s) failed — {last_err}')
+        return False
+
+    results = {}
+
+    # ── first pass: download all, build inline as primary PDBs arrive ─────
+    with ThreadPoolExecutor(max_workers=threads) as ex:
+        futures = {ex.submit(_fetch_pdb, aid, pdb_dir): aid for aid in all_aids}
+        for fut in as_completed(futures):
+            aid = futures[fut]
+            r = fut.result()
+            results[aid] = r
+            if r.startswith('fail'):
+                time.sleep(0.5)
+            else:
+                for qseqid in aid_primary_queries.get(aid, []):
+                    if qseqid not in built:
+                        built.add(qseqid)
+                        if _try_build_query(qseqid):
+                            n_ok += 1
+                        else:
+                            n_fail += 1
+
+    # ── retry failed downloads ─────────────────────────────────────────────
+    retry = [aid for aid, r in results.items() if r.startswith('fail')]
+    if retry:
+        print(f'  Retrying {len(retry)} failed download(s)...')
+        for aid in retry:
+            r = _fetch_pdb(aid, pdb_dir)
+            results[aid] = r
+            if r.startswith('fail'):
+                time.sleep(0.5)
+
+    # ── final pass: build any queries whose primary download failed ────────
+    for qseqid in query_hits:
+        if qseqid not in built:
+            built.add(qseqid)
+            if _try_build_query(qseqid):
+                n_ok += 1
+            else:
+                n_fail += 1
+
+    all_results = list(results.values())
+    summary = Counter(r.split(':')[0] for r in all_results)
+    for r in all_results:
+        if r.startswith('fail'):
+            print(f'  FAILED: {r}')
+    print(f"  Downloaded: {summary['downloaded']}  "
+          f"Already present: {summary['exists']}  "
+          f"Failed: {summary.get('failed', 0) + summary.get('fail', 0)}")
+
+    return n_ok, n_fail, timings
 
 
 # ── Stage 5: build output PDBs ─────────────────────────────────────────────────
@@ -626,15 +734,10 @@ def main():
         n_classA_queries = classA_df['qseqid'].n_unique() if len(classA_df) > 0 else 0
         print(f'  Loaded {n_classA_queries} Class A queries from {classA_pq}')
 
-        print('\n[4/5] Downloading AlphaFold reference PDBs...')
+        print('\n[4-5/5] Downloading and building Class A PDBs (pipelined)...')
         t4 = time.time()
-        stage_download(classA_df, pdb_dir, args.threads)
+        n_ok, n_fail, timings = stage_download_and_build(classA_df, pdb_dir, output_pdbs_dir, args.threads)
         print(f'  [{time.time()-t4:.1f}s]')
-
-        print('\n[5/5] Building output PDBs...')
-        t5 = time.time()
-        n_ok, n_fail, timings = stage_build_pdbs(classA_df, pdb_dir, output_pdbs_dir)
-        print(f'  [{time.time()-t5:.1f}s]')
 
         print()
         print('=' * 60)
@@ -690,17 +793,11 @@ def main():
         print(f'  Total runtime: {time.time()-t_total:.1f}s')
         return
 
-    # ── 4. Download PDBs ──────────────────────────────────────────────────────
-    print('\n[4/5] Downloading AlphaFold reference PDBs...')
+    # ── 4+5. Download and build PDBs (pipelined) ─────────────────────────────
+    print('\n[4-5/5] Downloading and building Class A PDBs (pipelined)...')
     t4 = time.time()
-    stage_download(classA_df, pdb_dir, args.threads)
+    n_ok, n_fail, timings = stage_download_and_build(classA_df, pdb_dir, output_pdbs_dir, args.threads)
     print(f'  [{time.time()-t4:.1f}s]')
-
-    # ── 5. Build output PDBs ──────────────────────────────────────────────────
-    print('\n[5/5] Building output PDBs...')
-    t5 = time.time()
-    n_ok, n_fail, timings = stage_build_pdbs(classA_df, pdb_dir, output_pdbs_dir)
-    print(f'  [{time.time()-t5:.1f}s]')
 
     print()
     print('=' * 60)

@@ -1431,6 +1431,7 @@ def main():
         candidates = candidates.head(args.limit)
         print(f'  (limited to first {args.limit})')
 
+    _write_status(f'Aligning {len(candidates)} Class C sequences...')
     print(f'\n[C-1/4] Aligning {len(candidates)} sequences (threads={args.threads})...')
     rows_list = list(candidates.iter_rows(named=True))
     total     = len(rows_list)
@@ -1460,6 +1461,7 @@ def main():
     merged = candidates.join(aln_df, on=['qseqid', 'sseqid'], how='inner')
 
     # ── [C-2] Download PAE + PDB files concurrently ──────────────────────────
+    _write_status(f'Downloading PAE + PDB files for {len(merged)} Class C sequences...')
     print('\n[C-2/4] Downloading PAE + PDB files (concurrent)...')
     afdb_ids = {_A.get_afdb_id(s) for s in merged['sseqid'] if _A.get_afdb_id(s)}
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -1469,6 +1471,7 @@ def main():
         f_pdb.result()
 
     # ── [C-3] Domain qualification ────────────────────────────────────────────
+    _write_status(f'Detecting domains for {len(merged)} Class C sequences (PAE graph)...')
     print(f'\n[C-3/4] Finding qualifying domains for {len(merged)} sequences...')
 
     # Pre-build ref_poly cache (serial, gemmi not thread-safe for writing)
@@ -1534,6 +1537,7 @@ def main():
     _fill_backend = _resolve_backend(args.backend)
     backend_label = 'MLX MiniFold' if _fill_backend else 'PyTorch MiniFold'
     mode_label = f'complete ({backend_label})' if args.fill_missing else 'domain'
+    _write_status(f'Building {len(classC_rows)} Class C structures...')
     print(f'\n[C-4/4] Building {len(classC_rows)} Class C {mode_label} structures...')
 
     if args.fill_missing:

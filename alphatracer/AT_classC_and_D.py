@@ -1376,6 +1376,7 @@ def main():
     _STATUS_PATH   = os.path.join(indir, '.cd_status')
 
     os.makedirs(outdir_C, exist_ok=True)
+    os.makedirs(pae_dir,  exist_ok=True)
 
     print('=' * 60)
     print('AlphaTracer 1.0  —  Class C + D Pipeline')

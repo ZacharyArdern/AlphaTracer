@@ -588,12 +588,13 @@ def main() -> None:
 
     # ── Class C + D ───────────────────────────────────────────────────────────
     if not args.skip_classC:
-        # Remove stale status file from any previous run before launching subprocess.
-        _cd_status_path = os.path.join(proc_dir, '.cd_status')
-        try:
-            os.remove(_cd_status_path)
-        except FileNotFoundError:
-            pass
+        # Remove stale sentinel files from any previous run so the progress bar
+        # does not show leftover counts before the current run writes them.
+        for _stale in ('.cd_status', '.classC_total', '.classD_total'):
+            try:
+                os.remove(os.path.join(proc_dir, _stale))
+            except FileNotFoundError:
+                pass
         if bar:
             bar.phase('Building Class C and D structures...')
         cmd_cd = [

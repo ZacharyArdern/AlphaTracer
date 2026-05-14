@@ -117,6 +117,7 @@ class _StatusBar:
     """Single updating status line shown during quiet-mode execution."""
 
     _BAR_WIDTH = 28
+    _LINE_WIDTH = 120  # clear at least this many chars when printing a permanent phase line
 
     def __init__(self, proc_dir: str, total: int, log_path: str):
         self.proc_dir  = proc_dir
@@ -124,7 +125,7 @@ class _StatusBar:
         self.log_path  = log_path
         self._phase    = 'Starting...'
         self._stop     = threading.Event()
-        self._lock     = threading.Lock()
+        self._lock     = threading.Lock()   # guards _phase + stdout writes
         self._thread   = threading.Thread(target=self._loop, daemon=True)
 
     def start(self) -> '_StatusBar':
@@ -136,9 +137,10 @@ class _StatusBar:
             if self._phase == label:
                 return
             self._phase = label
-        # Clear the current \r bar line, then print the phase as a permanent line.
-        sys.stdout.write(f'\r{" " * 90}\r  {label}\n')
-        sys.stdout.flush()
+            # Clear the current \r bar line, then print the phase as a permanent line.
+            # Hold _lock while writing so _draw() cannot interleave.
+            sys.stdout.write(f'\r{" " * self._LINE_WIDTH}\r  {label}\n')
+            sys.stdout.flush()
 
     def stop(self) -> None:
         self._stop.set()
@@ -176,6 +178,14 @@ class _StatusBar:
             result[cls] = (done, total)
         return result
 
+    def _read_cd_status(self) -> str | None:
+        """Read subprocess status written by AT_classC_and_D.py to .cd_status."""
+        try:
+            with open(os.path.join(self.proc_dir, '.cd_status')) as f:
+                return f.read().strip() or None
+        except Exception:
+            return None
+
     def _draw(self, final: bool = False) -> None:
         counts = self._class_counts()
         done   = sum(d for d, _ in counts.values())
@@ -185,9 +195,6 @@ class _StatusBar:
         filled = int(w * pct)
         bar    = '█' * filled + '░' * (w - filled)
 
-        with self._lock:
-            phase = self._phase
-
         active = [(k, d, t) for k, (d, t) in counts.items() if d > 0]
         if active:
             parts = []
@@ -195,17 +202,23 @@ class _StatusBar:
                 parts.append(f'Class {k}: {d}/{t}' if t is not None else f'Class {k}: {d}')
             detail = '  '.join(parts)
         else:
-            detail = phase
+            with self._lock:
+                detail = self._phase
 
         if final:
             line = f'\r  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  Done{" " * 35}\n'
         else:
             line = f'\r  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  {detail}{" " * 10}'
-        sys.stdout.write(line)
-        sys.stdout.flush()
+
+        with self._lock:
+            sys.stdout.write(line)
+            sys.stdout.flush()
 
     def _loop(self) -> None:
         while not self._stop.wait(0.5):
+            cd = self._read_cd_status()
+            if cd:
+                self.phase(cd)
             self._draw()
 
 
@@ -569,6 +582,12 @@ def main() -> None:
 
     # ── Class C + D ───────────────────────────────────────────────────────────
     if not args.skip_classC:
+        # Remove stale status file from any previous run before launching subprocess.
+        _cd_status_path = os.path.join(proc_dir, '.cd_status')
+        try:
+            os.remove(_cd_status_path)
+        except FileNotFoundError:
+            pass
         if bar:
             bar.phase('Building Class C and D structures...')
         cmd_cd = [

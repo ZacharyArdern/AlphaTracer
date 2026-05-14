@@ -985,9 +985,6 @@ def main():
     for (ni, nd), c in sorted(ins_counts.items()):
         print(f'    {ni} insertion(s) + {nd} deletion(s): {c}')
 
-    with open(os.path.join(indir, '.classB_total'), 'w') as _f:
-        _f.write(str(len(classB_df)))
-
     if len(classB_df) == 0:
         print('No Class B sequences.'); return
 
@@ -1074,6 +1071,9 @@ def main():
         print('  '.join(v.ljust(w) for v, w in zip(
             [r['query_id'], r['built_pdb'], r['ref_pdb'], r['status'], r['reason']],
             col_w)))
+
+    with open(os.path.join(indir, '.classB_total'), 'w') as _f:
+        _f.write(str(n_ok))
 
     print()
     print('=' * 60)

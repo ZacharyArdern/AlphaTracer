@@ -121,6 +121,18 @@ _PT_STATE  = None
 _OFS_STATE = None
 _USE_MLX   = None   # set on first _load_fold_models() call
 
+_STATUS_PATH = None  # set in main() to proc_dir/.cd_status
+
+
+def _write_status(msg: str) -> None:
+    """Write a one-line status message for run_alphatracer.py status bar polling."""
+    if _STATUS_PATH:
+        try:
+            with open(_STATUS_PATH, 'w') as _f:
+                _f.write(msg)
+        except Exception:
+            pass
+
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -454,7 +466,7 @@ def build_domain_pdb(domain_indices, ops, ref_poly, out_pdb,
             elif op[0] == 'insertion':
                 ins_aas = op[1]
                 if not residues:
-                    return False, 'insertion at domain start not supported', 0.
+                    continue  # leading insertion before any matched residues — skip, same as leading deletion
                 gap_sites.append((len(residues) - 1, 'insertion'))
                 prev = residues[-1]['atoms']
                 if not all(k in prev for k in ('N', 'CA', 'C')):
@@ -608,6 +620,7 @@ def _load_ofs_models():
     if _OFS_STATE is not None:
         return
 
+    _write_status('Loading OFS model (ESM2-650M + SubsEnsembleMLP)...')
     print('  [OFS] Loading ESM2-650M + SubsEnsembleMLP...', flush=True)
     t0 = time.perf_counter()
 
@@ -664,6 +677,7 @@ def _load_mlx_models(model_size='12L', compile_miniformer=True):
     if _MLX_STATE is not None:
         return
 
+    _write_status('Loading MLX model (ESM2-3B + MiniFold)...')
     print('  [MLX] Loading MLX ESM2-3B + MiniFold (once)...', flush=True)
     t0 = time.perf_counter()
 
@@ -850,6 +864,7 @@ def _load_pt_models(model_size='12L'):
     if _PT_STATE is not None:
         return
 
+    _write_status('Loading PyTorch MiniFold model...')
     print('  [PT] Loading PyTorch MiniFold...', flush=True)
     t0 = time.perf_counter()
 
@@ -1343,12 +1358,14 @@ def build_complete_structure(
 
 def main():
     args           = parse_args()
+    global _STATUS_PATH
     indir          = args.input_dir.rstrip('/')
     pdb_dir        = os.path.join(indir, 'AF_pdbs')
     pae_dir        = os.path.join(indir, 'AF_pae')
     outdir_C       = os.path.join(indir, 'output_pdbs_classC')
     outdir_D       = os.path.join(indir, 'output_pdbs_classD')
     threshold_frac = args.min_pctsim / 100.0
+    _STATUS_PATH   = os.path.join(indir, '.cd_status')
 
     os.makedirs(outdir_C, exist_ok=True)
 
@@ -1520,9 +1537,11 @@ def main():
     print(f'\n[C-4/4] Building {len(classC_rows)} Class C {mode_label} structures...')
 
     if args.fill_missing:
+        _write_status('Loading ESM2-3B + MiniFold model (Class C fill-missing)...')
         _load_fold_models(model_size=args.mini_model_size,
                           compile_miniformer=not args.no_compile,
                           backend=args.backend)
+        _write_status('Building Class C structures (fill-missing)...')
 
     n_ok_C = n_fail_C = 0
     timings_C = []
@@ -1688,7 +1707,9 @@ def main():
     print()
 
     os.makedirs(outdir_D, exist_ok=True)
+    _write_status('Loading ESM2-3B + MiniFold model (Class D)...')
     _load_fold_models(model_size=args.mini_model_size, backend=args.backend)
+    _write_status('Predicting Class D structures...')
 
     n_ok_D = n_fail_D = 0
     timings_D = []
@@ -1741,6 +1762,12 @@ def main():
     for r in range(max_global_r + 1):
         if not still_pending:
             break
+
+        recycling_label = 'no recycling' if r == 0 else f'{r} recycling{"s" if r > 1 else ""}'
+        _write_status(
+            f'Predicting Class D structures — round {r}/{max_global_r} '
+            f'({len(still_pending)} seqs, {recycling_label})...'
+        )
 
         # Pack into batches by B × max_len² token budget (memory scales with both)
         batches, cur, cur_max = [], [], 0

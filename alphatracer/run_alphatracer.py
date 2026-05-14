@@ -195,7 +195,8 @@ class _StatusBar:
         filled = int(w * pct)
         bar    = '█' * filled + '░' * (w - filled)
 
-        active = [(k, d, t) for k, (d, t) in counts.items() if d > 0 or t]
+        active = [(k, d, t) for k, (d, t) in counts.items()
+                  if (k in ('A', 'B') and d > 0) or t is not None]
         if active:
             parts = []
             for k, d, t in active:

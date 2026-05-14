@@ -531,13 +531,8 @@ def stage_download_and_build(classA_df, pdb_dir, output_pdbs_dir, threads):
         if primary_aid:
             aid_primary_queries[primary_aid].append(qseqid)
 
-    # All afdb_ids referenced across all hits (primary + fallbacks).
-    all_aids = set()
-    for hits in query_hits.values():
-        for row in hits:
-            aid = get_afdb_id(row['sseqid'])
-            if aid:
-                all_aids.add(aid)
+    # Only pre-download primary (top-pident) hits; fallbacks are fetched on demand.
+    all_aids = {aid for aid in (get_afdb_id(hits[0]['sseqid']) for hits in query_hits.values()) if aid}
 
     print(f'  {len(all_aids)} unique AlphaFold accession(s) to download (v{AFDB_VERSION})',
           flush=True)
@@ -553,6 +548,9 @@ def stage_download_and_build(classA_df, pdb_dir, output_pdbs_dir, threads):
         hits = query_hits[qseqid]
         last_err = 'no hits'
         for rank, row in enumerate(hits):
+            aid = get_afdb_id(row['sseqid'])
+            if aid and not os.path.exists(afdb_local_pdb(aid, pdb_dir)):
+                _fetch_pdb(aid, pdb_dir)   # on-demand fetch for fallback hits
             t0 = time.perf_counter()
             err = _try_build_pdb(row, pdb_dir, out_pdb)
             elapsed = time.perf_counter() - t0

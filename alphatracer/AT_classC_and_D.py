@@ -40,6 +40,7 @@ import time
 import json
 import gzip
 import argparse
+import threading
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -175,6 +176,9 @@ def parse_args():
                    help='pLDDT threshold: recycle until mean pLDDT >= this (default: 85)')
     p.add_argument('--max-recyclings',      type=int,   default=2,
                    help='Maximum recycling rounds (default: 2)')
+    p.add_argument('--min-recycle-plddt',   type=float, default=50.0,
+                   help='Stop recycling if pLDDT after round 0 is below this — '
+                        'sequence is likely disordered (default: 50)')
     p.add_argument('--ppl-short-threshold', type=int,   default=100,
                    help='Sequences <= this length skip recycling (default: 100)')
     # Class D options
@@ -1464,43 +1468,25 @@ def main():
                           orient='row')
     merged = candidates.join(aln_df, on=['qseqid', 'sseqid'], how='inner')
 
-    # ── [C-2] Download PAE + PDB files concurrently ──────────────────────────
-    _write_status(f'Downloading PAE + PDB files for {len(merged)} Class C sequences...')
-    print('\n[C-2/4] Downloading PAE + PDB files (concurrent)...')
-    afdb_ids = {_A.get_afdb_id(s) for s in merged['sseqid'] if _A.get_afdb_id(s)}
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_pae = ex.submit(stage_download_pae, afdb_ids, pae_dir, args.threads)
-        f_pdb = ex.submit(_B.stage_download,  afdb_ids, pdb_dir, args.threads)
-        f_pae.result()
-        f_pdb.result()
+    # ── [C-2/3] Download PAE+PDB and qualify domains (pipelined per template) ──
+    # Group rows by afdb_id so each template's PAE, PDB, and domain detection
+    # run together in one thread — qualification starts as soon as each
+    # template's files arrive, overlapping with downloads for other templates.
+    _write_status(f'Downloading PAE/PDB and detecting domains for {len(merged)} Class C sequences...')
+    print(f'\n[C-2+3/4] Downloading PAE+PDB and qualifying domains '
+          f'({len(merged)} sequences, threads={args.threads})...')
 
-    # ── [C-3] Domain qualification ────────────────────────────────────────────
-    _write_status(f'Detecting domains for {len(merged)} Class C sequences (PAE graph)...')
-    print(f'\n[C-3/4] Finding qualifying domains for {len(merged)} sequences...')
+    rows_by_afdb = {}
+    for row in merged.iter_rows(named=True):
+        aid = _A.get_afdb_id(row['sseqid'])
+        rows_by_afdb.setdefault(aid, []).append(row)
 
-    # Pre-build ref_poly cache (serial, gemmi not thread-safe for writing)
     _ref_poly_cache = {}
-    for afdb_id in {_A.get_afdb_id(r['sseqid']) for r in merged.iter_rows(named=True)
-                    if _A.get_afdb_id(r['sseqid'])}:
-        src_pdb = _A.afdb_local_pdb(afdb_id, pdb_dir)
-        if os.path.exists(src_pdb):
-            st = gemmi.read_structure(src_pdb)
-            _ref_poly_cache[afdb_id] = [r for r in st[0]['A']
-                                         if r.entity_type == gemmi.EntityType.Polymer]
+    _ref_poly_lock  = threading.Lock()
 
-    def _qualify_one(row):
-        afdb_id = _A.get_afdb_id(row['sseqid'])
-        if afdb_id is None:
-            return None, 'skip'
-        pae_path = _pae_local_path(afdb_id, pae_dir)
-        if not os.path.exists(pae_path):
-            return None, 'no_pae'
-        ref_poly = _ref_poly_cache.get(afdb_id)
-        if ref_poly is None:
-            return None, 'skip'
+    def _qualify_row(row, ref_poly, pae_path):
         _, ops     = _B.parse_alignment_ops(row['qseq_alg'], row['sseq_alg'])
-        rp_to_comp = _ref_pos_to_comp(row['qseq_alg'], row['sseq_alg'],
-                                       row['alg_comp'])
+        rp_to_comp = _ref_pos_to_comp(row['qseq_alg'], row['sseq_alg'], row['alg_comp'])
         ref_ss     = _B.compute_ref_ss(ref_poly)
         pae_res    = (args.pae_resolution_large
                       if len(ref_poly) > args.large_domain_threshold
@@ -1514,24 +1500,53 @@ def main():
         if not qualifying:
             return None, 'no_domain'
         best = max(qualifying, key=len)
-
         if len(best) < args.min_domain_size:
             return None, 'domain_too_small'
-
-        plddt_vals = []
-        for pos in best:
-            if pos < len(ref_poly):
-                ca = ref_poly[pos].find_atom('CA', '\0')
-                if ca:
-                    plddt_vals.append(ca.b_iso)
+        plddt_vals = [ref_poly[pos].find_atom('CA', '\0').b_iso
+                      for pos in best if pos < len(ref_poly)
+                      and ref_poly[pos].find_atom('CA', '\0')]
         if plddt_vals and (sum(plddt_vals) / len(plddt_vals)) < args.min_domain_plddt:
             return None, 'domain_low_plddt'
-
         return {**row, '_best_domain': best}, 'ok'
 
-    rows_list = list(merged.iter_rows(named=True))
+    def _fetch_and_qualify(afdb_id, rows):
+        if afdb_id is None:
+            return [(None, 'skip')] * len(rows)
+
+        # Ensure PAE file
+        pae_path = _pae_local_path(afdb_id, pae_dir)
+        if not os.path.exists(pae_path):
+            try:
+                urllib.request.urlretrieve(_pae_url(afdb_id), pae_path)
+            except Exception:
+                if os.path.exists(pae_path):
+                    os.remove(pae_path)
+                return [(None, 'no_pae')] * len(rows)
+
+        # Ensure PDB + ref_poly (most already cached from Class A)
+        ref_poly = _ref_poly_cache.get(afdb_id)
+        if ref_poly is None:
+            src_pdb = _A.afdb_local_pdb(afdb_id, pdb_dir)
+            if not os.path.exists(src_pdb):
+                _A._fetch_pdb(afdb_id, pdb_dir)
+            if os.path.exists(src_pdb):
+                st = gemmi.read_structure(src_pdb)
+                ref_poly = [r for r in st[0]['A']
+                            if r.entity_type == gemmi.EntityType.Polymer]
+                with _ref_poly_lock:
+                    _ref_poly_cache[afdb_id] = ref_poly
+
+        if ref_poly is None:
+            return [(None, 'skip')] * len(rows)
+
+        return [_qualify_row(row, ref_poly, pae_path) for row in rows]
+
+    qual_results = []
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
-        qual_results = list(ex.map(_qualify_one, rows_list))
+        futures = {ex.submit(_fetch_and_qualify, aid, rows): aid
+                   for aid, rows in rows_by_afdb.items()}
+        for fut in as_completed(futures):
+            qual_results.extend(fut.result())
 
     classC_rows = []
     n_qualify = n_no_pae = n_no_domain = n_too_small = n_low_plddt = 0
@@ -1828,13 +1843,18 @@ def main():
                     print(f'    [{done_count}/{len(pending)}] {seq_id}  '
                           f'len={len(seq)}  plddt={mean_plddt:.2f}  r={r}',
                           flush=True)
-                    if mean_plddt >= plddt_thresh or r >= max_r:
+                    floor_hit = (r == 0 and mean_plddt < args.min_recycle_plddt)
+                    if mean_plddt >= plddt_thresh or r >= max_r or floor_hit:
                         out_pdb = os.path.join(outdir_D, f'classD:{seq_id}.pdb')
                         pdb_str = _restore_selenocysteine(pdb_str, sec_pos_map.get(seq_id, []))
                         with open(out_pdb, 'w') as fh:
                             fh.write(pdb_str)
                         n_ok_D += 1
                         timings_D.append(elapsed_per)
+                        if floor_hit:
+                            print(f'      → pLDDT {mean_plddt:.1f} < floor '
+                                  f'{args.min_recycle_plddt:.0f}, skipping recycling',
+                                  flush=True)
                         D_rows.append({
                             'query_id':   seq_id,
                             'len':        len(seq),

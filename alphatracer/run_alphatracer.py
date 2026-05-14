@@ -337,6 +337,8 @@ def parse_args() -> argparse.Namespace:
                         help='pLDDT threshold: recycle until mean pLDDT >= this (default: 85)')
     grp_cd.add_argument('--max-recyclings', type=int, default=2,
                         help='Max recycling rounds per sequence (default: 2)')
+    grp_cd.add_argument('--min-recycle-plddt', type=float, default=50.0,
+                        help='Skip recycling if round-0 pLDDT < this — likely disordered (default: 50)')
     grp_cd.add_argument('--ppl-short-threshold', type=int, default=100,
                         help='Sequences <= this length skip recycling (default: 100)')
     grp_cd.add_argument('--no-classD', action='store_true', default=False,
@@ -620,6 +622,7 @@ def main() -> None:
             '--anchor-k',               str(args.anchor_k),
             '--plddt-threshold',        str(args.plddt_threshold),
             '--max-recyclings',         str(args.max_recyclings),
+            '--min-recycle-plddt',      str(args.min_recycle_plddt),
             '--ppl-short-threshold',    str(args.ppl_short_threshold),
             '--batch-tokens',           str(args.batch_tokens),
             '--max-seq-len',            str(args.max_seq_len),

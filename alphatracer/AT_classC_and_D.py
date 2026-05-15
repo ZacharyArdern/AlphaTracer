@@ -7,23 +7,19 @@ Class C: domain-level matching for sequences not in Class A/B.
   clustering.  Domains passing window-identity and beta-strand-indel checks
   are built with backbone grafting + CCD + OpenMM minimisation.
   With --fill-missing, query regions outside the qualifying domain are filled
-  using OFS PPL-gated MLX MiniFold predictions + L-BFGS-B + CCD.
+  using MLX MiniFold predictions + L-BFGS-B + CCD.
 
 Class D: full-length structure prediction for every query sequence not covered
   by Class A, B, or C.
 
-  PPL gating (OFS: ESM2-650M + SubsEnsembleMLP, single forward pass):
-    seq len <= 100 aa  →  0 recyclings  (no PPL computed)
-    seq len >  100 aa  →  compute OFS PPL
-      PPL > 7.5  OR  len > 400  →  3 recyclings
-      otherwise                 →  0 recyclings
+  Recycling is pLDDT-gated: starts at 0 recyclings, retries up to --max-recyclings
+  if mean pLDDT < --plddt-threshold.  Short sequences (<=--ppl-short-threshold aa)
+  always use 0 recyclings.
 
   On Apple Silicon (M-series Mac): MLX MiniFold is used for structure prediction.
   On Linux / WSL / Intel Mac: PyTorch MiniFold (jwohlwend/minifold) is used instead,
   requiring: pip install git+https://github.com/jwohlwend/minifold.git
   Backend can be overridden with --backend {auto|mlx|cuda|cpu}.
-
-  OFS models (PyTorch/CPU) and the fold model are each loaded ONCE into memory.
 
 Usage
 -----
@@ -74,8 +70,6 @@ def _resolve_backend(backend_arg):
 
 _HERE        = os.path.dirname(os.path.abspath(__file__))   # alphatracer/
 _PKG_PARENT  = os.path.dirname(_HERE)                        # repo root
-_OFS_DIR     = os.path.normpath(
-    os.path.join(_HERE, '..', '..', 'one_fell_swoop', 'OFS_model'))
 
 # Ensure the repo root is on sys.path so 'alphatracer' is importable
 # whether this file is run directly (subprocess) or as part of the package.
@@ -92,7 +86,6 @@ AFDB_VERSION = _A.AFDB_VERSION
 # ── MiniFold-MLX weight paths (downloaded from HuggingFace on first use) ─────
 
 _HF_REPO = 'z-ardern/MiniFold_MLX_weights'
-_OFS_SUBS_PATH = os.path.join(_OFS_DIR, 'model_checkpoints', 'subs_checkpoint_jan.pt')
 
 
 def _get_weights(model_size='48L', use_quantized_esm=True):
@@ -116,10 +109,8 @@ def _get_weights(model_size='48L', use_quantized_esm=True):
 # Global state — each loaded at most once
 # MLX: (tokenizer, minifold_mlx, pad_id)
 # PT:  (predict_mod, alphabet, model, config, device)  — PyTorch fallback
-# OFS: (esm_model, subs_model, alphabet, device)
 _MLX_STATE = None
 _PT_STATE  = None
-_OFS_STATE = None
 _USE_MLX   = None   # set on first _load_fold_models() call
 
 _STATUS_PATH = None  # set in main() to proc_dir/.cd_status
@@ -164,7 +155,7 @@ def parse_args():
     p.add_argument('--flank',               type=int,   default=3)
     p.add_argument('--limit',               type=int,   default=0)
     p.add_argument('--fill-missing',        action='store_true', default=False,
-                   help='Fill non-domain regions with OFS-gated MLX MiniFold (classC)')
+                   help='Fill non-domain regions with MLX MiniFold (classC)')
     p.add_argument('--min-frag-len',        type=int,   default=5)
     p.add_argument('--lbfgsb-iters',        type=int,   default=300)
     p.add_argument('--mini-model-size',     type=str,   default='12L',
@@ -620,64 +611,7 @@ def build_domain_pdb(domain_indices, ops, ref_poly, out_pdb,
         return False, str(e), time.perf_counter() - t0
 
 
-# ── OFS + MLX model loading and prediction ────────────────────────────────────
-
-def _load_ofs_models():
-    """Load OFS ESM2-650M + SubsEnsembleMLP once (PyTorch/MPS)."""
-    global _OFS_STATE
-    if _OFS_STATE is not None:
-        return
-
-    _write_status('Loading OFS model (ESM2-650M + SubsEnsembleMLP)...')
-    print('  [OFS] Loading ESM2-650M + SubsEnsembleMLP...', flush=True)
-    t0 = time.perf_counter()
-
-    import torch
-    # OFS runs on CPU to avoid competing with MLX for Metal/MPS memory.
-    # ESM2-650M is small enough that CPU inference is fast (~0.5-1s per seq).
-    device = torch.device('cpu')
-
-    # OFS uses its own model_definition module and the installed fair-esm
-    if str(_OFS_DIR) not in sys.path:
-        sys.path.insert(0, str(_OFS_DIR))
-    import model_definition as md
-    import esm as esm_lib
-
-    esm_model, alphabet = esm_lib.pretrained.esm2_t33_650M_UR50D()
-    esm_model.eval().to(device)
-
-    subs_model = md.SubsEnsembleMLP()
-    subs_model.load_state_dict(torch.load(_OFS_SUBS_PATH, map_location='cpu'))
-    subs_model.eval().to(device)
-
-    _OFS_STATE = (esm_model, subs_model, alphabet, device)
-    print(f'  [OFS] Ready in {time.perf_counter()-t0:.1f}s  (device={device})',
-          flush=True)
-
-
-def _ofs_ppl(seq):
-    """OFS pseudo-perplexity: single forward pass, returns (ppl, elapsed_s)."""
-    global _OFS_STATE
-    import torch
-    import numpy as np
-
-    esm_model, subs_model, alphabet, device = _OFS_STATE
-    batch_converter = alphabet.get_batch_converter()
-    _, _, tokens = batch_converter([('seq', seq)])
-    tokens = tokens.to(device)
-
-    t0 = time.perf_counter()
-    with torch.no_grad():
-        embedding    = esm_model(tokens, repr_layers=[33], return_contacts=False)
-        embedding    = embedding['representations'][33][0, 1:-1].unsqueeze(0)
-        subs_profile = subs_model(embedding).softmax(dim=-1)[0]
-
-    subs_np   = subs_profile.detach().cpu().float().numpy()
-    token_ids = tokens[0].cpu().numpy()[1:-1] - 4  # shift to 0-indexed AA
-    ce        = -np.mean(np.log(subs_np[np.arange(len(token_ids)), token_ids]
-                                + 1e-9))
-    return float(np.exp(ce)), time.perf_counter() - t0
-
+# ── MLX model loading and prediction ─────────────────────────────────────────
 
 def _load_mlx_models(model_size='12L', compile_miniformer=True):
     """Load MLX MiniFold (with fine-tuned ESM2 layers) once."""
@@ -1021,7 +955,7 @@ def _fold_predict_batch(batch_items, num_recycling):
     return _pt_predict_batch(batch_items, num_recycling)
 
 
-# ── Missing-region fill (OFS-gated fold prediction + CCD + L-BFGS-B) ─────────
+# ── Missing-region fill (fold prediction + CCD + L-BFGS-B) ──────────────────
 
 def _map_query_positions(domain_set, ops):
     qp     = 0
@@ -1730,7 +1664,7 @@ def main():
                    if sid not in covered_ids}
 
     print(f'\n{"=" * 60}')
-    print('AlphaTracer 1.0  —  Class D  (OFS-gated MLX MiniFold prediction)')
+    print('AlphaTracer 1.0  —  Class D  (pLDDT-gated MLX MiniFold prediction)')
     print(f'{"=" * 60}')
     print(f'  Total filtered:   {len(all_seqs)}')
     print(f'  Covered A/B/C:    {len(covered_ids)}  '

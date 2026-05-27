@@ -324,7 +324,7 @@ def parse_args() -> argparse.Namespace:
                         help='Minimum mean AF pLDDT over domain for Class C (default: 70)')
     grp_cd.add_argument('--c-limit', type=int, default=0,
                         help='Limit Class C to first N sequences (0=all)')
-    grp_cd.add_argument('--fill-missing', action='store_true', default=False,
+    grp_cd.add_argument('--no-fill-missing', action='store_false', dest='fill_missing', default=True,
                         help='Fill non-domain query regions with OFS+MLX MiniFold (Class C)')
     grp_cd.add_argument('--min-frag-len', type=int, default=5,
                         help='Minimum fragment length to predict (Class C fill-missing)')
@@ -628,7 +628,7 @@ def main() -> None:
             '--max-seq-len',            str(args.max_seq_len),
             *_flag('--limit',        args.c_limit),
             *_flag('--classD-limit', args.classD_limit),
-            *_bool_flag('--fill-missing', args.fill_missing),
+            *_bool_flag('--no-fill-missing', not args.fill_missing),
             *_bool_flag('--no-classD',    args.no_classD),
         ]
         run(cmd_cd, 'Class C + D', extra_env={'KMP_DUPLICATE_LIB_OK': 'TRUE'})

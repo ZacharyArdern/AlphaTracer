@@ -6,8 +6,8 @@ Class C: domain-level matching for sequences not in Class A/B.
   Decomposes best-hit reference structures into rigid domains via PAE graph
   clustering.  Domains passing window-identity and beta-strand-indel checks
   are built with backbone grafting + CCD + OpenMM minimisation.
-  With --fill-missing, query regions outside the qualifying domain are filled
-  using MLX MiniFold predictions + L-BFGS-B + CCD.
+  Query regions outside the qualifying domain are filled using MLX MiniFold
+  predictions + L-BFGS-B + CCD (use --no-fill-missing to disable).
 
 Class D: full-length structure prediction for every query sequence not covered
   by Class A, B, or C.
@@ -154,7 +154,7 @@ def parse_args():
     p.add_argument('--ccd-tol',             type=float, default=0.15)
     p.add_argument('--flank',               type=int,   default=3)
     p.add_argument('--limit',               type=int,   default=0)
-    p.add_argument('--fill-missing',        action='store_true', default=False,
+    p.add_argument('--no-fill-missing',     action='store_false', dest='fill_missing', default=True,
                    help='Fill non-domain regions with MLX MiniFold (classC)')
     p.add_argument('--min-frag-len',        type=int,   default=5)
     p.add_argument('--lbfgsb-iters',        type=int,   default=300)

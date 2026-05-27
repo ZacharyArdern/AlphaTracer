@@ -13,8 +13,8 @@ Class D: full-length structure prediction for every query sequence not covered
   by Class A, B, or C.
 
   Recycling is pLDDT-gated: starts at 0 recyclings, retries up to --max-recyclings
-  if mean pLDDT < --plddt-threshold.  Short sequences (<=--ppl-short-threshold aa)
-  always use 0 recyclings.
+  if mean pLDDT < --plddt-threshold.  If round-0 pLDDT < --min-recycle-plddt the
+  sequence is accepted immediately (likely disordered; recycling won't help).
 
   On Apple Silicon (M-series Mac): MLX MiniFold is used for structure prediction.
   On Linux / WSL / Intel Mac: PyTorch MiniFold (jwohlwend/minifold) is used instead,
@@ -170,8 +170,6 @@ def parse_args():
     p.add_argument('--min-recycle-plddt',   type=float, default=50.0,
                    help='Stop recycling if pLDDT after round 0 is below this — '
                         'sequence is likely disordered (default: 50)')
-    p.add_argument('--ppl-short-threshold', type=int,   default=100,
-                   help='Sequences <= this length skip recycling (default: 100)')
     # Class D options
     p.add_argument('--no-classD',           action='store_true', default=False,
                    help='Skip Class D predictions')
@@ -688,29 +686,6 @@ def _restore_selenocysteine(pdb_str, sec_positions):
     return ''.join(lines)
 
 
-def _fold_predict_adaptive(seq, plddt_threshold, max_recyclings, ppl_short_threshold=100):
-    """Predict with iterative recycling gated by pLDDT threshold.
-
-    Starts at num_recycling=0; after each round, if mean_plddt < plddt_threshold
-    and rounds remain, re-predicts with one more recycling step.  Short sequences
-    (len <= ppl_short_threshold) are always predicted with 0 recyclings.
-    Selenocysteine (U) is replaced with C before prediction and restored afterwards.
-
-    Returns (pdb_str, mean_plddt, total_elapsed_s, recyclings_used).
-    """
-    seq_pred, sec_pos = _mask_selenocysteine(seq)
-    max_r = 0 if len(seq_pred) <= ppl_short_threshold else max_recyclings
-    total_elapsed = 0.0
-    pdb_str, mean_plddt = None, 0.0
-    r_used = 0
-    for r in range(max_r + 1):
-        pdb_str, mean_plddt, elapsed = _fold_predict(seq_pred, r)
-        total_elapsed += elapsed
-        r_used = r
-        if mean_plddt >= plddt_threshold:
-            break
-    pdb_str = _restore_selenocysteine(pdb_str, sec_pos)
-    return pdb_str, mean_plddt, total_elapsed, r_used
 
 
 def _mlx_predict(seq, num_recycling):
@@ -997,28 +972,67 @@ def _find_missing_segments(qp_map, full_qseq, min_len):
 
 def _predict_fragments_inprocess(frag_dict, work_dir,
                                   plddt_threshold, max_recyclings,
-                                  ppl_short_threshold, max_seq_len=800):
-    """Predict each fragment with pLDDT-gated recycling.
+                                  min_recycle_plddt=50.0,
+                                  batch_tokens=262144, max_seq_len=800):
+    """Predict fragments using batch multi-round recycling (same logic as Class D).
     Returns {name: pdb_path} for successes.
     """
+    import traceback as _tb
     os.makedirs(work_dir, exist_ok=True)
-    pdbs = {}
+
+    pending = []
+    sec_pos_map = {}
     for name, seq in frag_dict.items():
         if max_seq_len > 0 and len(seq) > max_seq_len:
             print(f'    [{name}] SKIP: len={len(seq)} > max_seq_len={max_seq_len}',
                   flush=True)
             continue
-        try:
-            pdb_str, mean_plddt, _, r_used = _fold_predict_adaptive(
-                seq, plddt_threshold, max_recyclings, ppl_short_threshold)
-            print(f'    [{name}] len={len(seq)} plddt={mean_plddt:.1f} '
-                  f'recyclings={r_used}', flush=True)
-            pdb_path = os.path.join(work_dir, f'{name}.pdb')
-            with open(pdb_path, 'w') as fh:
-                fh.write(pdb_str)
-            pdbs[name] = pdb_path
-        except Exception as exc:
-            print(f'    [{name}] prediction failed: {exc}', flush=True)
+        masked_seq, sec_pos = _mask_selenocysteine(seq)
+        if sec_pos:
+            sec_pos_map[name] = sec_pos
+        pending.append((name, masked_seq))
+
+    pending.sort(key=lambda x: len(x[1]))
+
+    pdbs = {}
+    still_pending = pending
+
+    for r in range(max_recyclings + 1):
+        if not still_pending:
+            break
+
+        batches, cur, cur_max = [], [], 0
+        for item in still_pending:
+            L = len(item[1])
+            new_max = max(cur_max, L)
+            if cur and (len(cur) + 1) * new_max * new_max > batch_tokens:
+                batches.append(cur); cur, cur_max = [], 0; new_max = L
+            cur.append(item); cur_max = new_max
+        if cur:
+            batches.append(cur)
+
+        next_pending = []
+        for batch in batches:
+            try:
+                batch_results = _fold_predict_batch([(n, seq) for n, seq in batch], r)
+                for (name, pdb_str, mean_plddt), (_, seq) in zip(batch_results, batch):
+                    floor_hit = (r == 0 and mean_plddt < min_recycle_plddt)
+                    if mean_plddt >= plddt_threshold or r >= max_recyclings or floor_hit:
+                        pdb_str = _restore_selenocysteine(pdb_str, sec_pos_map.get(name, []))
+                        pdb_path = os.path.join(work_dir, f'{name}.pdb')
+                        with open(pdb_path, 'w') as fh:
+                            fh.write(pdb_str)
+                        pdbs[name] = pdb_path
+                        print(f'    [{name}] len={len(seq)} plddt={mean_plddt:.1f} r={r}',
+                              flush=True)
+                    else:
+                        next_pending.append((name, seq))
+            except Exception as exc:
+                _tb.print_exc()
+                print(f'    [batch] prediction failed: {exc}', flush=True)
+
+        still_pending = next_pending
+
     return pdbs
 
 
@@ -1095,8 +1109,8 @@ def build_complete_structure(
     domain_indices, ops, ref_poly, full_qseq, out_pdb, work_dir,
     mm_iters=300, ccd_iters=200, ccd_tol=0.15, n_flank=3,
     min_frag_len=5, lbfgsb_iters=300, model_size='12L', anchor_k=1000.0,
-    plddt_threshold=85.0, max_recyclings=2, ppl_short_threshold=100,
-    max_seq_len=800, loop_closer='ccd',
+    plddt_threshold=85.0, max_recyclings=2, min_recycle_plddt=50.0,
+    batch_tokens=262144, max_seq_len=800, loop_closer='ccd',
 ):
     t0 = time.perf_counter()
     try:
@@ -1181,7 +1195,8 @@ def build_complete_structure(
                 frag_dict, work_dir,
                 plddt_threshold=plddt_threshold,
                 max_recyclings=max_recyclings,
-                ppl_short_threshold=ppl_short_threshold,
+                min_recycle_plddt=min_recycle_plddt,
+                batch_tokens=batch_tokens,
                 max_seq_len=max_seq_len,
             )
         except Exception as exc:
@@ -1328,7 +1343,7 @@ def main():
         print(f'  Fill missing:   ON  (MLX MiniFold {args.mini_model_size}, '
               f'min_frag={args.min_frag_len} aa, L-BFGS-B={args.lbfgsb_iters})')
     print(f'  Recycling:      pLDDT-gated (threshold={args.plddt_threshold}, '
-          f'max={args.max_recyclings}); len<={args.ppl_short_threshold} aa → no recycling')
+          f'max={args.max_recyclings}, floor={args.min_recycle_plddt})')
     print(f'  MLX compile:    {"OFF (--no-compile)" if args.no_compile else "ON (mx.compile MiniFormer)"}')
     print(f'  Max seq len:    {args.max_seq_len if args.max_seq_len > 0 else "unlimited"}'
           f'  (MLX Metal OOM guard)')
@@ -1553,7 +1568,8 @@ def main():
                 model_size=args.mini_model_size, anchor_k=args.anchor_k,
                 plddt_threshold=args.plddt_threshold,
                 max_recyclings=args.max_recyclings,
-                ppl_short_threshold=args.ppl_short_threshold,
+                min_recycle_plddt=args.min_recycle_plddt,
+                batch_tokens=args.batch_tokens,
                 max_seq_len=args.max_seq_len,
                 loop_closer=args.loop_closer,
             )
@@ -1716,8 +1732,7 @@ def main():
         masked_seq, sec_pos = _mask_selenocysteine(seq)
         if sec_pos:
             sec_pos_map[seq_id] = sec_pos
-        max_r = 0 if len(masked_seq) <= args.ppl_short_threshold else args.max_recyclings
-        pending.append((seq_id, masked_seq, max_r))
+        pending.append((seq_id, masked_seq, args.max_recyclings))
 
     pending.sort(key=lambda x: len(x[1]))   # shorter first → tighter padding
 

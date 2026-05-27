@@ -118,7 +118,6 @@ class _StatusBar:
     """Single updating status line shown during quiet-mode execution."""
 
     _BAR_WIDTH = 28
-    _LINE_WIDTH = 120  # clear at least this many chars when printing a permanent phase line
 
     def __init__(self, proc_dir: str, total: int, log_path: str):
         self.proc_dir  = proc_dir
@@ -140,7 +139,7 @@ class _StatusBar:
             self._phase = label
             # Clear the current \r bar line, then print the phase as a permanent line.
             # Hold _lock while writing so _draw() cannot interleave.
-            sys.stdout.write(f'\r{" " * self._LINE_WIDTH}\r  {label}\n')
+            sys.stdout.write(f'\x1b[2K\r  {label}\n')
             sys.stdout.flush()
 
     def stop(self) -> None:
@@ -196,8 +195,7 @@ class _StatusBar:
         filled = int(w * pct)
         bar    = '█' * filled + '░' * (w - filled)
 
-        active = [(k, d, t) for k, (d, t) in counts.items()
-                  if (k in ('A', 'B') and d > 0) or t is not None]
+        active = [(k, d, t) for k, (d, t) in counts.items() if d > 0]
         if active:
             parts = []
             for k, d, t in active:
@@ -208,12 +206,11 @@ class _StatusBar:
                 detail = self._phase
 
         if final:
-            line = f'\r  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  Done{" " * 35}\n'
+            line = f'\x1b[2K\r  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  Done\n'
         else:
-            cols = shutil.get_terminal_size((120, 24)).columns
+            cols = shutil.get_terminal_size((80, 24)).columns
             content = f'  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  {detail}'
-            content = f'{content:<{cols - 1}}'[:cols - 1]
-            line = f'\r{content}'
+            line = f'\x1b[2K\r{content[:cols - 1]}'
 
         with self._lock:
             sys.stdout.write(line)

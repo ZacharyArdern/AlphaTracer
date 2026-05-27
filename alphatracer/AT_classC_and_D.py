@@ -1775,9 +1775,9 @@ def main():
                 elapsed_per = (time.perf_counter() - t_batch) / len(batch)
                 for (seq_id, pdb_str, mean_plddt), (_, seq, max_r) in zip(batch_results, batch):
                     done_count += 1
-                    print(f'    [{done_count}/{len(pending)}] {seq_id}  '
-                          f'len={len(seq)}  plddt={mean_plddt:.2f}  r={r}',
-                          flush=True)
+                    _prog = (f'  Class D: {done_count}/{len(pending)}  {seq_id}  '
+                             f'len={len(seq)}  plddt={mean_plddt:.2f}  r={r}')
+                    print(f'{_prog:<80}', end='\r', flush=True)
                     floor_hit = (r == 0 and mean_plddt < args.min_recycle_plddt)
                     if mean_plddt >= plddt_thresh or r >= max_r or floor_hit:
                         out_pdb = os.path.join(outdir_D, f'classD:{seq_id}.pdb')
@@ -1787,6 +1787,7 @@ def main():
                         n_ok_D += 1
                         timings_D.append(elapsed_per)
                         if floor_hit:
+                            print()  # end the \r line before warning
                             print(f'      → pLDDT {mean_plddt:.1f} < floor '
                                   f'{args.min_recycle_plddt:.0f}, skipping recycling',
                                   flush=True)
@@ -1802,9 +1803,11 @@ def main():
                     else:
                         next_pending.append((seq_id, seq, max_r))
                         done_count -= 1   # will be counted again next round
+                print()  # finalize the \r progress line after each batch
             except Exception as exc:
                 _tb.print_exc()
                 elapsed_per = (time.perf_counter() - t_batch) / max(len(batch), 1)
+                print()  # end any partial \r line before error output
                 print(f'  Batch FAILED: {exc}', flush=True)
                 for seq_id, seq, _ in batch:
                     n_fail_D += 1

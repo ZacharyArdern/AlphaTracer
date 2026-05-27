@@ -37,6 +37,7 @@ Usage
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -209,7 +210,10 @@ class _StatusBar:
         if final:
             line = f'\r  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  Done{" " * 35}\n'
         else:
-            line = f'\r  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  {detail}{" " * 10}'
+            cols = shutil.get_terminal_size((120, 24)).columns
+            content = f'  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  {detail}'
+            content = f'{content:<{cols - 1}}'[:cols - 1]
+            line = f'\r{content}'
 
         with self._lock:
             sys.stdout.write(line)

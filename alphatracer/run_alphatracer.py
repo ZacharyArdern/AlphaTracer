@@ -321,14 +321,14 @@ def parse_args() -> argparse.Namespace:
                        help='Max number of indels allowed')
     grp_b.add_argument('--max-indel-len', type=int, default=5,
                        help='Max length of each indel')
-    grp_b.add_argument('--b-min-pctsim', type=float, default=30.0,
+    grp_b.add_argument('--b-min-pctsim', type=float, default=40.0,
                        help='Min identity for Class B candidates')
     grp_b.add_argument('--b-limit', type=int, default=0,
                        help='Process only first N Class B structures (0=all)')
 
     # ── Class C/D ─────────────────────────────────────────────────────────────
     grp_cd = p.add_argument_group('Class C/D options')
-    grp_cd.add_argument('--c-min-pctsim', type=float, default=50.0,
+    grp_cd.add_argument('--c-min-pctsim', type=float, default=40.0,
                         help='Min identity for Class C candidates')
     grp_cd.add_argument('--pae-cutoff', type=float, default=5.0,
                         help='PAE graph edge weight cutoff (Å)')
@@ -424,8 +424,8 @@ def main() -> None:
     print('AlphaTracer  —  Full Pipeline Wrapper')
     print('=' * 60)
     search_method = 'diamond' if args.diamond else 'kmer'
-    b_min_pctsim  = args.b_min_pctsim if args.diamond else 1
-    c_min_pctsim  = args.c_min_pctsim if args.diamond else 1
+    b_min_pctsim  = args.b_min_pctsim
+    c_min_pctsim  = args.c_min_pctsim
 
     print(f'  Input:        {args.input}  ({total_seqs} sequences)')
     print(f'  DB dir:       {dbdir}')

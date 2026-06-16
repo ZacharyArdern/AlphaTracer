@@ -102,7 +102,7 @@ def parse_args():
     p.add_argument('-t', '--threads', type=int, default=4)
     p.add_argument('--max-indels',    type=int,   default=3)
     p.add_argument('--max-indel-len', type=int,   default=5)
-    p.add_argument('--min-pctsim',     type=float, default=30.0)
+    p.add_argument('--min-pctsim',     type=float, default=40.0)
     p.add_argument('--mm-iters',      type=int,   default=300,
                    help='OpenMM minimisation iterations (default: 300)')
     p.add_argument('--ccd-iters',     type=int,   default=200,

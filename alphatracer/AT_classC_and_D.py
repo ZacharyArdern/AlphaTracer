@@ -23,7 +23,7 @@ Class D: full-length structure prediction for every query sequence not covered
 
 Usage
 -----
-  python AT_classC_and_D.py -i AT_processing_<name>/ [--min-pctsim 50] [-t 4]
+  python AT_classC_and_D.py -i AT_processing_<name>/ [--min-pctsim 40] [-t 4]
 
   Weights are downloaded automatically from HuggingFace on first run.
 """
@@ -137,7 +137,7 @@ def parse_args():
                    help='Processing directory from AT_classA.py / AT_classB.py')
     p.add_argument('-t', '--threads',       type=int,   default=4)
     # Class C options
-    p.add_argument('--min-pctsim',           type=float, default=50.0)
+    p.add_argument('--min-pctsim',           type=float, default=40.0)
     p.add_argument('--window-size',         type=int,   default=40)
     p.add_argument('--pae-cutoff',          type=float, default=5.0)
     p.add_argument('--pae-power',           type=float, default=1.0)

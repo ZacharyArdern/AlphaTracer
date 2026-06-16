@@ -435,6 +435,8 @@ def main() -> None:
     print(f'  Python (C/D): {py_cd}')
     print(f'  Loop closer:  {args.loop_closer}')
     print(f'  Backend:      {args.backend}')
+    print(f'  Min identity: Class A ≥{args.pctsim}% (window={args.window_size} aa)  '
+          f'B ≥{b_min_pctsim}%  C ≥{c_min_pctsim}%')
     skips = [c for c, s in [('A', args.skip_classA), ('B', args.skip_classB),
                               ('C', args.skip_classC)] if s]
     skips += (['D'] if args.no_classD else [])

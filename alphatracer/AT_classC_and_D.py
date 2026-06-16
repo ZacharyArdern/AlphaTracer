@@ -78,7 +78,8 @@ if _PKG_PARENT not in sys.path:
 
 from alphatracer import AT_classA as _A
 from alphatracer import AT_classB as _B
-from alphatracer.pae_to_domains import parse_pae_file, domains_from_pae_matrix_igraph
+from alphatracer.pae_to_domains import (parse_pae_file, domains_from_pae_matrix_igraph,
+                                        parse_pae_batch_rust, domains_from_pae_subsampled)
 
 ONE_TO_THREE = _A.ONE_TO_THREE
 AFDB_VERSION = _A.AFDB_VERSION
@@ -141,6 +142,10 @@ def parse_args():
     p.add_argument('--pae-cutoff',          type=float, default=5.0)
     p.add_argument('--pae-power',           type=float, default=1.0)
     p.add_argument('--pae-resolution',      type=float, default=1.0)
+    p.add_argument('--pae-step',            type=int,   default=0,
+                   help='Subsampling step for PAE matrix (1=full, 2=every 2nd, etc). '
+                        '0=auto: step=2 for n≤300, step=3 for n>300 (default: 0)')
+
     p.add_argument('--pae-resolution-large', type=float, default=2.0,
                    help='graph_resolution for domains >--large-domain-threshold aa (default: 2.0)')
     p.add_argument('--large-domain-threshold', type=int, default=500,
@@ -278,6 +283,25 @@ def get_domains(pae_path, pae_power, pae_cutoff, pae_resolution):
         return [sorted(d) for d in domains]
     except Exception as e:
         print(f'  PAE domain error ({pae_path}): {e}')
+        return []
+
+
+def get_domains_from_matrix(pae_matrix, n_full, step, pae_power, pae_cutoff, pae_resolution):
+    """Domain detection on a pre-parsed (possibly subsampled) PAE matrix."""
+    try:
+        if step > 1:
+            return domains_from_pae_subsampled(
+                pae_matrix, n_full, step,
+                pae_power=pae_power, pae_cutoff=pae_cutoff,
+                graph_resolution=pae_resolution,
+            )
+        domains = domains_from_pae_matrix_igraph(
+            pae_matrix, pae_power=pae_power, pae_cutoff=pae_cutoff,
+            graph_resolution=pae_resolution,
+        )
+        return [sorted(d) for d in domains]
+    except Exception as e:
+        print(f'  PAE domain error (pre-parsed matrix): {e}')
         return []
 
 
@@ -1332,9 +1356,10 @@ def main():
     print('=' * 60)
     print(f'  Input dir:      {indir}/')
     print(f'  Min pctsim:     {args.min_pctsim}%  (window={args.window_size} aa)')
+    _step_label = 'auto (2/3)' if args.pae_step == 0 else str(args.pae_step)
     print(f'  PAE cutoff:     {args.pae_cutoff} Å  '
-          f'power={args.pae_power}  resolution={args.pae_resolution} '
-          f'(>{args.large_domain_threshold} aa: {args.pae_resolution_large})')
+          f'power={args.pae_power}  resolution={args.pae_resolution}  '
+          f'step={_step_label}  (>{args.large_domain_threshold} aa: {args.pae_resolution_large})')
     print(f'  CCD:            {args.ccd_iters} iters, tol={args.ccd_tol} Å, '
           f'flank={args.flank}')
     print(f'  OpenMM:         {args.mm_iters} minimisation steps')
@@ -1418,30 +1443,96 @@ def main():
                           orient='row')
     merged = candidates.join(aln_df, on=['qseqid', 'sseqid'], how='inner')
 
-    # ── [C-2/3] Download PAE+PDB and qualify domains (pipelined per template) ──
-    # Group rows by afdb_id so each template's PAE, PDB, and domain detection
-    # run together in one thread — qualification starts as soon as each
-    # template's files arrive, overlapping with downloads for other templates.
+    # ── [C-2/3] Download PAE+PDB, batch-parse PAE, qualify domains ───────────────
+    # Four phases:
+    #   2a. Parallel PAE download (all templates at once)
+    #   2b. Parallel PDB download + ref_poly load
+    #   2c. Batch Rust PAE parse (one subprocess, all files)
+    #   3.  Parallel domain detection + qualification using pre-parsed matrices
     _write_status(f'Downloading PAE/PDB and detecting domains for {len(merged)} Class C sequences...')
     print(f'\n[C-2+3/4] Downloading PAE+PDB and qualifying domains '
-          f'({len(merged)} sequences, threads={args.threads})...')
+          f'({len(merged)} sequences, pae-step={args.pae_step}, threads={args.threads})...')
 
     rows_by_afdb = {}
     for row in merged.iter_rows(named=True):
         aid = _A.get_afdb_id(row['sseqid'])
         rows_by_afdb.setdefault(aid, []).append(row)
 
-    _ref_poly_cache = {}
-    _ref_poly_lock  = threading.Lock()
+    all_afdb_ids = {aid for aid in rows_by_afdb if aid is not None}
 
-    def _qualify_row(row, ref_poly, pae_path):
+    # Phase 2a: Download all PAE files in parallel
+    print('  [2a] Downloading PAE files...')
+    stage_download_pae(all_afdb_ids, pae_dir, args.threads)
+
+    # Phase 2b: Download PDB files + load ref_poly in parallel
+    print('  [2b] Downloading PDB files...')
+    _B.stage_download(all_afdb_ids, pdb_dir, args.threads)
+    _ref_poly_cache = {}
+
+    def _load_ref_poly(afdb_id):
+        src_pdb = _A.afdb_local_pdb(afdb_id, pdb_dir)
+        if not os.path.exists(src_pdb):
+            return afdb_id, None
+        try:
+            st = gemmi.read_structure(src_pdb)
+            poly = [r for r in st[0]['A'] if r.entity_type == gemmi.EntityType.Polymer]
+            return afdb_id, poly
+        except Exception:
+            return afdb_id, None
+
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        for aid, poly in ex.map(_load_ref_poly, sorted(all_afdb_ids)):
+            if poly is not None:
+                _ref_poly_cache[aid] = poly
+
+    # Phase 2c: Batch Rust parse with adaptive step size
+    # Small proteins (file < ~350 KB, n ≲ 300): step=2 (Jacc ~0.91, safe)
+    # Large proteins (file ≥ ~350 KB, n ≳ 300): step=3 (Jacc ~0.95+, largest-domain accurate)
+    # Override with --pae-step if provided (non-zero).
+    print('  [2c] Batch-parsing PAE matrices (Rust)...')
+    _SIZE_THRESH = 350_000  # bytes
+    pae_paths_map = {aid: _pae_local_path(aid, pae_dir)
+                     for aid in all_afdb_ids
+                     if os.path.exists(_pae_local_path(aid, pae_dir))}
+    pae_matrices_by_afdb = {}
+    if pae_paths_map:
+        if args.pae_step:
+            groups = [(args.pae_step, pae_paths_map)]
+        else:
+            small = {a: p for a, p in pae_paths_map.items() if os.path.getsize(p) < _SIZE_THRESH}
+            large = {a: p for a, p in pae_paths_map.items() if os.path.getsize(p) >= _SIZE_THRESH}
+            groups = [(2, small), (3, large)]
+
+        for step, group in groups:
+            if not group:
+                continue
+            try:
+                aid_list  = list(group.keys())
+                path_list = [group[a] for a in aid_list]
+                matrices  = parse_pae_batch_rust(path_list, step=step)
+                for aid, path in zip(aid_list, path_list):
+                    if path in matrices:
+                        n_full, mat = matrices[path]
+                        pae_matrices_by_afdb[aid] = (n_full, mat, step)
+            except Exception as e:
+                print(f'  WARNING: Rust batch PAE parse (step={step}) failed ({e}); falling back to Python')
+                for aid, path in group.items():
+                    try:
+                        pae = _load_pae_matrix(path)
+                        pae_matrices_by_afdb[aid] = (pae.shape[0], pae.astype('float32'), 1)
+                    except Exception:
+                        pass
+
+    # Phase 3: Threaded domain detection + qualification using pre-parsed matrices
+    def _qualify_row(row, ref_poly, n_full, pae_matrix, step):
         _, ops     = _B.parse_alignment_ops(row['qseq_alg'], row['sseq_alg'])
         rp_to_comp = _ref_pos_to_comp(row['qseq_alg'], row['sseq_alg'], row['alg_comp'])
         ref_ss     = _B.compute_ref_ss(ref_poly)
         pae_res    = (args.pae_resolution_large
-                      if len(ref_poly) > args.large_domain_threshold
+                      if n_full > args.large_domain_threshold
                       else args.pae_resolution)
-        domains    = get_domains(pae_path, args.pae_power, args.pae_cutoff, pae_res)
+        domains    = get_domains_from_matrix(pae_matrix, n_full, step,
+                                             args.pae_power, args.pae_cutoff, pae_res)
         if not domains:
             return None, 'no_domain'
         qualifying = [d for d in domains
@@ -1459,41 +1550,21 @@ def main():
             return None, 'domain_low_plddt'
         return {**row, '_best_domain': best}, 'ok'
 
-    def _fetch_and_qualify(afdb_id, rows):
+    def _qualify_afdb(afdb_id, rows):
         if afdb_id is None:
             return [(None, 'skip')] * len(rows)
-
-        # Ensure PAE file
-        pae_path = _pae_local_path(afdb_id, pae_dir)
-        if not os.path.exists(pae_path):
-            try:
-                urllib.request.urlretrieve(_pae_url(afdb_id), pae_path)
-            except Exception:
-                if os.path.exists(pae_path):
-                    os.remove(pae_path)
-                return [(None, 'no_pae')] * len(rows)
-
-        # Ensure PDB + ref_poly (most already cached from Class A)
         ref_poly = _ref_poly_cache.get(afdb_id)
         if ref_poly is None:
-            src_pdb = _A.afdb_local_pdb(afdb_id, pdb_dir)
-            if not os.path.exists(src_pdb):
-                _B.stage_download({afdb_id}, pdb_dir, 1)
-            if os.path.exists(src_pdb):
-                st = gemmi.read_structure(src_pdb)
-                ref_poly = [r for r in st[0]['A']
-                            if r.entity_type == gemmi.EntityType.Polymer]
-                with _ref_poly_lock:
-                    _ref_poly_cache[afdb_id] = ref_poly
-
-        if ref_poly is None:
             return [(None, 'skip')] * len(rows)
-
-        return [_qualify_row(row, ref_poly, pae_path) for row in rows]
+        pae_data = pae_matrices_by_afdb.get(afdb_id)
+        if pae_data is None:
+            return [(None, 'no_pae')] * len(rows)
+        n_full, pae_matrix, step = pae_data
+        return [_qualify_row(row, ref_poly, n_full, pae_matrix, step) for row in rows]
 
     qual_results = []
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
-        futures = {ex.submit(_fetch_and_qualify, aid, rows): aid
+        futures = {ex.submit(_qualify_afdb, aid, rows): aid
                    for aid, rows in rows_by_afdb.items()}
         for fut in as_completed(futures):
             qual_results.extend(fut.result())

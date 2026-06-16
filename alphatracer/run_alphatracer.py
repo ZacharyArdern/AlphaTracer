@@ -36,6 +36,7 @@ Usage
 """
 
 import argparse
+import gzip
 import os
 import shutil
 import subprocess
@@ -108,7 +109,8 @@ def _count_pdbs(path: str) -> int:
 
 def _count_fasta(path: str) -> int:
     try:
-        with open(path) as f:
+        open_fn = gzip.open if path.endswith('.gz') else open
+        with open_fn(path, 'rt') as f:
             return sum(1 for line in f if line.startswith('>'))
     except Exception:
         return 0
@@ -178,6 +180,15 @@ class _StatusBar:
             result[cls] = (done, total)
         return result
 
+    def _read_db_counts(self, cls: str) -> dict | None:
+        """Read .classX_db_counts JSON written live by AT_classA/B scripts."""
+        try:
+            import json
+            with open(os.path.join(self.proc_dir, f'.class{cls}_db_counts')) as f:
+                return json.load(f)
+        except Exception:
+            return None
+
     def _read_cd_status(self) -> str | None:
         """Read subprocess status written by AT_classC_and_D.py to .cd_status."""
         try:
@@ -192,14 +203,22 @@ class _StatusBar:
         total  = self.total
         pct    = done / max(total, 1)
         w      = self._BAR_WIDTH
-        filled = int(w * pct)
+        filled = min(int(w * pct), w)
         bar    = '█' * filled + '░' * (w - filled)
 
         active = [(k, d, t) for k, (d, t) in counts.items() if d > 0]
         if active:
             parts = []
             for k, d, t in active:
-                parts.append(f'Class {k}: {d}/{t}' if t is not None else f'Class {k}: {d}')
+                base = f'Class {k}: {d}/{t}' if t is not None else f'Class {k}: {d}'
+                if k in ('A', 'B'):
+                    db = self._read_db_counts(k)
+                    if db and db.get('ok'):
+                        ok = db['ok']
+                        afdb = ok.get('afdb', 0)
+                        esm  = ok.get('esm_atlas', 0)
+                        base += f' (AF={afdb} ESM={esm})'
+                parts.append(base)
             detail = '  '.join(parts)
         else:
             with self._lock:
@@ -257,6 +276,9 @@ def parse_args() -> argparse.Namespace:
     )
     shared.add_argument('--top-k', type=int, default=5,
                         help='Hits per query from kmer search (default: 5)')
+    shared.add_argument('--sketch-db', default=None, metavar='PATH',
+                        help='Custom sketch database parquet for kmer Class A search '
+                             '(e.g. ESMAtlas). Forwarded to AT_classA_kmer.py.')
     shared.add_argument('-t', '--threads', type=int, default=4,
                         help='CPU threads')
     shared.add_argument('--mm-iters', type=int, default=300,
@@ -490,6 +512,7 @@ def main() -> None:
                 '--pctsim',        str(args.pctsim),
                 '--outdir',        proc_dir,
                 '--classify-only',
+                *_flag('--sketch-db', args.sketch_db),
             ]
             run(cmd_a_classify, 'Class A — classify (kmer)')
 
@@ -503,6 +526,7 @@ def main() -> None:
                 '--pctsim',             str(args.pctsim),
                 '--outdir',             proc_dir,
                 '--download-build-only',
+                *_flag('--sketch-db', args.sketch_db),
             ]
 
             if not args.skip_classB:

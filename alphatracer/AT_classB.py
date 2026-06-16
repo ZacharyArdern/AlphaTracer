@@ -134,6 +134,67 @@ def get_afdb_id(sseqid):
 def afdb_local_pdb(afdb_id, pdb_dir):
     return os.path.join(pdb_dir, f'{afdb_id}-model_v{AFDB_VERSION}.pdb')
 
+def _esm_local_pdb(protein_hash, pdb_dir):
+    return os.path.join(pdb_dir, f'esm_{protein_hash}.pdb')
+
+_HAS_DB_TYPE = False  # overridden at runtime by auto-detection from allhits.pq
+_ESM_DIR = os.environ.get('AT_ESM_DIR',
+               os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            '..', '..', '..', 'Data', 'ESMAtlas'))
+
+
+def _fetch_esm_pdbs_classB(esm_rows, pdb_dir, n_workers=8):
+    """Batch-fetch ESM Atlas structure blobs from Lance and write as PDB files."""
+    esm_dir = os.path.abspath(_ESM_DIR)
+    if esm_dir not in sys.path:
+        sys.path.insert(0, esm_dir)
+    try:
+        import esm_query as _esm
+    except ImportError:
+        print(f'  [WARN] Cannot import esm_query from {esm_dir} — ESM Atlas hits will be skipped')
+        return
+
+    hits = []
+    seen = set()
+    for row in esm_rows:
+        ph  = row.get('protein_hash') or ''
+        fid = row.get('fragment_id', -1)
+        fr  = row.get('frag_row', -1)
+        if not ph or fid < 0 or fr < 0 or ph in seen:
+            continue
+        seen.add(ph)
+        if not os.path.exists(_esm_local_pdb(ph, pdb_dir)):
+            hits.append({'fragment_id': fid, 'frag_row': fr, 'protein_hash': ph})
+
+    if not hits:
+        return
+
+    print(f'  Fetching {len(hits)} ESM Atlas structure(s) from S3...', flush=True)
+    t0 = time.time()
+    try:
+        results = _esm.query_from_hits(hits, columns=['protein_hash', 'structure_blob'],
+                                        n_workers=n_workers)
+    except Exception as e:
+        print(f'  [WARN] ESM Atlas fetch failed: {type(e).__name__}: {e}')
+        return
+
+    n_written = 0
+    for batch in results.to_batches():
+        hashes = batch['protein_hash'].to_pylist()
+        blobs  = batch['structure_blob'].to_pylist()
+        for ph, blob in zip(hashes, blobs):
+            pdb_path = _esm_local_pdb(ph, pdb_dir)
+            try:
+                with open(pdb_path, 'w') as f:
+                    f.write(_esm.blob_to_pdb(blob))
+                n_written += 1
+            except Exception as e:
+                print(f'  [WARN] ESM Atlas decode failed for {ph}: {e}')
+
+    print(f'  Fetched {n_written}/{len(hits)} ESM Atlas structure(s) in {time.time()-t0:.1f}s',
+          flush=True)
+
+
 def _is_valid_pdb(path):
     try:
         with open(path, 'rb') as f:
@@ -579,19 +640,27 @@ def build_classB_structure(row, pdb_dir, out_pdb, mm_iters, ccd_iters,
         sseq_alg  = row['sseq_alg']
         sseqid    = row['sseqid']
 
-        afdb_id = get_afdb_id(sseqid)
-        if afdb_id is None:
-            return False, f'cannot parse AFDB id from "{sseqid}"', 0.
-
-        src_pdb = afdb_local_pdb(afdb_id, pdb_dir)
-        if not os.path.exists(src_pdb):
-            return False, f'source PDB not found ({afdb_id})', 0.
+        db_type = row.get('db_type', 'afdb') or 'afdb'
+        if db_type == 'esm_atlas':
+            protein_hash = row.get('protein_hash') or sseqid.split('|')[0]
+            src_pdb = _esm_local_pdb(protein_hash, pdb_dir)
+            if not os.path.exists(src_pdb):
+                return False, f'ESM Atlas PDB not cached ({protein_hash})', 0.
+        else:
+            afdb_id = get_afdb_id(sseqid)
+            if afdb_id is None:
+                return False, f'cannot parse AFDB id from "{sseqid}"', 0.
+            src_pdb = afdb_local_pdb(afdb_id, pdb_dir)
+            if not os.path.exists(src_pdb):
+                return False, f'source PDB not found ({afdb_id})', 0.
 
         # ── 1. Parse alignment ────────────────────────────────────────────────
         _, ops = parse_alignment_ops(qseq_alg, sseq_alg)
 
         # ── 2. Read reference backbone ────────────────────────────────────────
-        st       = gemmi.read_structure(src_pdb)
+        st = gemmi.read_structure(src_pdb)
+        if db_type == 'esm_atlas':
+            st.setup_entities()
         ref_ch   = st[0]['A']
         ref_poly = [r for r in ref_ch if r.entity_type == gemmi.EntityType.Polymer]
 
@@ -912,6 +981,7 @@ def main():
     print()
 
     # ── Load hits ─────────────────────────────────────────────────────────────
+    global _HAS_DB_TYPE
     hits_df = None
     for fname in ['allhits.pq', 'tophits.pq']:
         p = os.path.join(indir, fname)
@@ -921,6 +991,7 @@ def main():
             break
     if hits_df is None:
         sys.exit(f'No allhits.pq/tophits.pq in {indir}')
+    _HAS_DB_TYPE = 'db_type' in hits_df.columns
 
     classA_path = os.path.join(indir, 'classA.pq')
     if not os.path.exists(classA_path):
@@ -993,52 +1064,89 @@ def main():
         print(f'  (limited to first {args.limit} sequences)')
 
     # ── [3] Download ──────────────────────────────────────────────────────────
-    print('\n[3/4] Downloading AlphaFold PDBs...')
-    afdb_ids = {get_afdb_id(s) for s in classB_df['sseqid'] if get_afdb_id(s)}
+    print('\n[3/4] Downloading reference PDBs...')
+    rows_list_b = list(classB_df.iter_rows(named=True))
+    if _HAS_DB_TYPE and 'db_type' in classB_df.columns:
+        afdb_rows = [r for r in rows_list_b if (r.get('db_type') or 'afdb') == 'afdb']
+        esm_rows  = [r for r in rows_list_b if (r.get('db_type') or 'afdb') == 'esm_atlas']
+    else:
+        afdb_rows = rows_list_b
+        esm_rows  = []
+    afdb_ids = {get_afdb_id(r['sseqid']) for r in afdb_rows if get_afdb_id(r['sseqid'])}
+    if esm_rows:
+        import threading as _threading
+        print(f'  Pre-fetching {len(esm_rows)} ESM Atlas structure(s) (background)...')
+        _esm_thread = _threading.Thread(
+            target=_fetch_esm_pdbs_classB, args=(esm_rows, pdb_dir),
+            kwargs={'n_workers': 16}, daemon=True)
+        _esm_thread.start()
+    else:
+        _esm_thread = None
     stage_download(afdb_ids, pdb_dir, args.threads)
+    if _esm_thread is not None:
+        _esm_thread.join()
 
     # ── [4] Build structures (parallel — OpenMM releases the GIL) ────────────
     print(f'\n[4/4] Building {len(classB_df)} Class B structures '
           f'(threads={args.threads})...')
     n_ok = n_fail = 0
+    ok_by_db: Counter = Counter()
+    fail_by_db: Counter = Counter()
     timings = []
     failure_reasons = {}
+    import threading as _threading, json as _json
+    _counts_lock = _threading.Lock()
+    _counts_path = os.path.join(indir, '.classB_db_counts')
+
+    def _write_b_counts():
+        tmp = _counts_path + '.tmp'
+        with open(tmp, 'w') as f:
+            _json.dump({'ok': dict(ok_by_db), 'fail': dict(fail_by_db)}, f)
+        os.replace(tmp, _counts_path)
 
     def _build_one(row):
         qseqid  = row['qseqid']
+        db_type = row.get('db_type', 'afdb') or 'afdb'
         out_pdb = os.path.join(outdir, f'classB:{qseqid}.pdb')
         if os.path.exists(out_pdb) and os.path.getsize(out_pdb) > 0:
-            return qseqid, True, None, 0.0, True   # cached
+            return qseqid, True, None, 0.0, True, db_type   # cached
         ok, err, elapsed = build_classB_structure(
             row, pdb_dir, out_pdb,
             args.mm_iters, args.ccd_iters, args.ccd_tol, args.flank,
             loop_closer=args.loop_closer,
         )
-        return qseqid, ok, err, elapsed, False
+        return qseqid, ok, err, elapsed, False, db_type
 
     from concurrent.futures import as_completed
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
         futs = {ex.submit(_build_one, row): row['qseqid']
                 for row in classB_df.iter_rows(named=True)}
         for fut in as_completed(futs):
-            qseqid, ok, err, elapsed, cached = fut.result()
-            if cached:
-                n_ok += 1
-            elif ok:
-                print(f'  {qseqid}: OK  {elapsed:.2f}s')
-                n_ok += 1; timings.append(elapsed)
-            else:
-                print(f'  {qseqid}: FAILED — {err}')
-                failure_reasons[qseqid] = err or ''
-                n_fail += 1
+            qseqid, ok, err, elapsed, cached, db = fut.result()
+            with _counts_lock:
+                if cached:
+                    n_ok += 1; ok_by_db[db] += 1
+                elif ok:
+                    print(f'  {qseqid}: OK  {elapsed:.2f}s')
+                    n_ok += 1; ok_by_db[db] += 1; timings.append(elapsed)
+                else:
+                    print(f'  {qseqid}: FAILED — {err}')
+                    failure_reasons[qseqid] = err or ''
+                    n_fail += 1; fail_by_db[db] += 1
+                _write_b_counts()
 
     # ── Mapping table ─────────────────────────────────────────────────────────
     table_rows = []
     for row in classB_df.iter_rows(named=True):
         qseqid  = row['qseqid']
         out_pdb = os.path.join(outdir, f'classB:{qseqid}.pdb')
-        afdb_id = get_afdb_id(row['sseqid'])
-        ref_pdb = afdb_local_pdb(afdb_id, pdb_dir) if afdb_id else ''
+        db_type = row.get('db_type', 'afdb') or 'afdb'
+        if db_type == 'esm_atlas':
+            protein_hash = row.get('protein_hash') or row['sseqid'].split('|')[0]
+            ref_pdb = _esm_local_pdb(protein_hash, pdb_dir)
+        else:
+            afdb_id = get_afdb_id(row['sseqid'])
+            ref_pdb = afdb_local_pdb(afdb_id, pdb_dir) if afdb_id else ''
         ok      = os.path.exists(out_pdb) and os.path.getsize(out_pdb) > 0
         table_rows.append({
             'query_id':  qseqid,
@@ -1080,7 +1188,13 @@ def main():
     print('Class B complete.')
     print(f'  Class B sequences:  {len(classB_df)}')
     print(f'  PDBs written:       {n_ok}')
+    if _HAS_DB_TYPE:
+        print(f'    AFDB:           {ok_by_db["afdb"]}')
+        print(f'    ESM Atlas:      {ok_by_db["esm_atlas"]}')
     print(f'  PDBs failed:        {n_fail}')
+    if _HAS_DB_TYPE and n_fail:
+        print(f'    AFDB:           {fail_by_db["afdb"]}')
+        print(f'    ESM Atlas:      {fail_by_db["esm_atlas"]}')
     if timings:
         print(f'  Time per structure: min={min(timings):.2f}s  '
               f'mean={sum(timings)/len(timings):.2f}s  '

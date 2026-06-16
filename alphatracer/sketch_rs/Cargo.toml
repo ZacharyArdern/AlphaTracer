@@ -23,6 +23,10 @@ path = "src/index_seqs.rs"
 name = "cluster"
 path = "src/cluster.rs"
 
+[[bin]]
+name = "parse-pae"
+path = "src/parse_pae.rs"
+
 [dependencies]
 rayon = "1"
 parquet = { version = "55", features = ["arrow"] }

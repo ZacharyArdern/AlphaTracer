@@ -100,8 +100,12 @@ def parse_args():
     p.add_argument('-i', '--input-dir', required=True,
                    help='Processing directory produced by AT_classA.py')
     p.add_argument('-t', '--threads', type=int, default=4)
-    p.add_argument('--max-indels',    type=int,   default=3)
-    p.add_argument('--max-indel-len', type=int,   default=5)
+    p.add_argument('--max-indels',          type=int, default=3)
+    p.add_argument('--max-indel-len',       type=int, default=5)
+    p.add_argument('--max-loop-indels',     type=int, default=8,
+                   help='Max indels allowed when all fall in loop/coil context (default: 8)')
+    p.add_argument('--max-loop-indel-len',  type=int, default=20,
+                   help='Max length per indel in loop/coil context (default: 20)')
     p.add_argument('--min-pctsim',     type=float, default=40.0)
     p.add_argument('--mm-iters',      type=int,   default=300,
                    help='OpenMM minimisation iterations (default: 300)')
@@ -216,13 +220,28 @@ def align_nw(qseqid, sseqid, qseq, sseq):
         return None
 
 
-def classify_classB(qseq_alg, sseq_alg, max_indels, max_indel_len):
+def classify_classB(qseq_alg, sseq_alg, max_indels, max_indel_len,
+                    max_loop_indels=8, max_loop_indel_len=20):
+    """Return True if this alignment qualifies for Class B.
+
+    Strict path  : ≤max_indels indels each ≤max_indel_len aa.
+    Relaxed path : ≤max_loop_indels indels each ≤max_loop_indel_len aa.
+                   These must additionally pass an all-loop SS check at build
+                   time (_indel_ss_context returns non-E and non-H for every
+                   indel); beta-strand and helix-flanked indels are rejected
+                   then.  Terminal query gaps are excluded from both counts.
+    """
     ref_gaps = [len(m.group()) for m in re.finditer(r'-+', sseq_alg)]
     qry_gaps = [len(m.group()) for m in re.finditer(r'-+', qseq_alg.strip('-'))]
     all_gaps = ref_gaps + qry_gaps
     if not all_gaps:
         return False
-    return len(all_gaps) <= max_indels and max(all_gaps) <= max_indel_len
+    n, mx = len(all_gaps), max(all_gaps)
+    if n <= max_indels and mx <= max_indel_len:
+        return True
+    if n <= max_loop_indels and mx <= max_loop_indel_len:
+        return True
+    return False
 
 
 def parse_alignment_ops(qseq_alg, sseq_alg):
@@ -626,7 +645,8 @@ def _get_platform():
 # ── Per-structure build ───────────────────────────────────────────────────────
 
 def build_classB_structure(row, pdb_dir, out_pdb, mm_iters, ccd_iters,
-                            ccd_tol, n_flank, loop_closer='ccd'):
+                            ccd_tol, n_flank, loop_closer='ccd',
+                            max_indels=3, max_indel_len=5):
     """Build one Class B backbone structure.
 
     Returns (success, error_msg, elapsed_s).
@@ -690,6 +710,20 @@ def build_classB_structure(row, pdb_dir, out_pdb, mm_iters, ccd_iters,
                 return False, (
                     f'{op[0]} flanked by beta-strand at ref context (E-rejection)'
                 ), time.perf_counter() - t0
+
+        # For relaxed-path candidates (exceed strict indel limits), also reject
+        # if any indel is helix-flanked — only all-coil indels are safe to close.
+        ref_gaps = [len(m.group()) for m in re.finditer(r'-+', sseq_alg)]
+        qry_gaps = [len(m.group()) for m in re.finditer(r'-+', qseq_alg.strip('-'))]
+        all_gaps = ref_gaps + qry_gaps
+        n_ind, mx_ind = (len(all_gaps), max(all_gaps)) if all_gaps else (0, 0)
+        is_relaxed = all_gaps and (n_ind > max_indels or mx_ind > max_indel_len)
+        if is_relaxed:
+            for k, op in enumerate(ops):
+                if indel_contexts.get(k) == 'H':
+                    return False, (
+                        f'{op[0]} helix-flanked on relaxed path (H-rejection)'
+                    ), time.perf_counter() - t0
 
         # ── 3. Build flat residue list ────────────────────────────────────────
         # Each entry: {'resname': str, 'atoms': dict, 'from_ref': bool}
@@ -974,7 +1008,8 @@ def main():
     print('AlphaTracer 1.0  —  Class B Pipeline  (CCD + backbone OpenMM)')
     print('=' * 60)
     print(f'  Input dir:      {indir}/')
-    print(f'  Max indels:     {args.max_indels}  (each ≤ {args.max_indel_len} aa)')
+    print(f'  Max indels:     {args.max_indels} (each ≤{args.max_indel_len} aa)  '
+          f'| loop relaxed: {args.max_loop_indels} (each ≤{args.max_loop_indel_len} aa)')
     print(f'  CCD:            {args.ccd_iters} iters, tol={args.ccd_tol} Å, '
           f'flank={args.flank}')
     print(f'  OpenMM:         {args.mm_iters} minimisation steps')
@@ -1035,13 +1070,35 @@ def main():
                           orient='row')
     merged = non_classA.join(aln_df, on=['qseqid', 'sseqid'], how='inner')
 
+    # Apply real NW identity threshold (approx_pident is kmer Jaccard, not NW)
+    def _nw_pident(r):
+        q, s = r['qseq_alg'], r['sseq_alg']
+        start = len(q) - len(q.lstrip('-'))
+        end   = len(q.rstrip('-')) or len(q)
+        matches = sum(1 for a, b in zip(q[start:end], s[start:end]) if a == b and a != '-')
+        aligned  = sum(1 for a, b in zip(q[start:end], s[start:end]) if a != '-' or b != '-')
+        return 100.0 * matches / aligned if aligned else 0.0
+
+    _thresh = args.min_pctsim
+    pre_filter = len(merged)
+    merged = merged.filter(
+        pl.struct(['qseq_alg', 'sseq_alg']).map_elements(
+            lambda r: _nw_pident(r) >= _thresh,
+            return_dtype=pl.Boolean,
+        )
+    )
+    print(f'  NW identity ≥{_thresh}%: {len(merged)}/{pre_filter} pass')
+
     # ── [2] Classify Class B ──────────────────────────────────────────────────
     print(f'\n[2/4] Classifying Class B '
-          f'(≤{args.max_indels} indels, each ≤{args.max_indel_len} aa)...')
+          f'(strict: ≤{args.max_indels} indels ≤{args.max_indel_len} aa; '
+          f'relaxed loop: ≤{args.max_loop_indels} indels ≤{args.max_loop_indel_len} aa)...')
+    _mi, _mil, _mli, _mlil = (args.max_indels, args.max_indel_len,
+                               args.max_loop_indels, args.max_loop_indel_len)
     classB_df = merged.filter(
         pl.struct(['qseq_alg', 'sseq_alg']).map_elements(
             lambda r: classify_classB(r['qseq_alg'], r['sseq_alg'],
-                                      args.max_indels, args.max_indel_len),
+                                      _mi, _mil, _mli, _mlil),
             return_dtype=pl.Boolean,
         )
     )
@@ -1114,6 +1171,7 @@ def main():
             row, pdb_dir, out_pdb,
             args.mm_iters, args.ccd_iters, args.ccd_tol, args.flank,
             loop_closer=args.loop_closer,
+            max_indels=args.max_indels, max_indel_len=args.max_indel_len,
         )
         return qseqid, ok, err, elapsed, False, db_type
 

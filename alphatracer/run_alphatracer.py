@@ -318,9 +318,13 @@ def parse_args() -> argparse.Namespace:
     # ── Class B ───────────────────────────────────────────────────────────────
     grp_b = p.add_argument_group('Class B options')
     grp_b.add_argument('--max-indels', type=int, default=3,
-                       help='Max number of indels allowed')
+                       help='Max indels (strict path)')
     grp_b.add_argument('--max-indel-len', type=int, default=5,
-                       help='Max length of each indel')
+                       help='Max length per indel (strict path)')
+    grp_b.add_argument('--max-loop-indels', type=int, default=8,
+                       help='Max indels when all fall in loop/coil context (default: 8)')
+    grp_b.add_argument('--max-loop-indel-len', type=int, default=20,
+                       help='Max indel length in loop/coil context (default: 20)')
     grp_b.add_argument('--b-min-pctsim', type=float, default=40.0,
                        help='Min identity for Class B candidates')
     grp_b.add_argument('--b-limit', type=int, default=0,
@@ -424,8 +428,11 @@ def main() -> None:
     print('AlphaTracer  —  Full Pipeline Wrapper')
     print('=' * 60)
     search_method = 'diamond' if args.diamond else 'kmer'
-    b_min_pctsim  = args.b_min_pctsim
-    c_min_pctsim  = args.c_min_pctsim
+    # kmer approx_pident is Jaccard-based and systematically lower than NW
+    # identity; pass threshold=1 to the pre-NW filter and let Class B/C apply
+    # the real threshold after NW alignment instead.
+    b_min_pctsim  = args.b_min_pctsim if args.diamond else 1
+    c_min_pctsim  = args.c_min_pctsim if args.diamond else 1
 
     print(f'  Input:        {args.input}  ({total_seqs} sequences)')
     print(f'  DB dir:       {dbdir}')
@@ -486,9 +493,11 @@ def main() -> None:
                     py_main, _script('AT_classB.py'),
                     '-i', proc_dir,
                     '-t', str(args.threads),
-                    '--max-indels',    str(args.max_indels),
-                    '--max-indel-len', str(args.max_indel_len),
-                    '--min-pctsim',    str(b_min_pctsim),
+                    '--max-indels',         str(args.max_indels),
+                    '--max-indel-len',      str(args.max_indel_len),
+                    '--max-loop-indels',    str(args.max_loop_indels),
+                    '--max-loop-indel-len', str(args.max_loop_indel_len),
+                    '--min-pctsim',         str(b_min_pctsim),
                     '--mm-iters',      str(args.mm_iters),
                     '--ccd-iters',     str(args.ccd_iters),
                     '--ccd-tol',       str(args.ccd_tol),
@@ -536,9 +545,11 @@ def main() -> None:
                     py_main, _script('AT_classB.py'),
                     '-i', proc_dir,
                     '-t', str(args.threads),
-                    '--max-indels',    str(args.max_indels),
-                    '--max-indel-len', str(args.max_indel_len),
-                    '--min-pctsim',    str(b_min_pctsim),
+                    '--max-indels',         str(args.max_indels),
+                    '--max-indel-len',      str(args.max_indel_len),
+                    '--max-loop-indels',    str(args.max_loop_indels),
+                    '--max-loop-indel-len', str(args.max_loop_indel_len),
+                    '--min-pctsim',         str(b_min_pctsim),
                     '--mm-iters',      str(args.mm_iters),
                     '--ccd-iters',     str(args.ccd_iters),
                     '--ccd-tol',       str(args.ccd_tol),
@@ -596,9 +607,11 @@ def main() -> None:
                 py_main, _script('AT_classB.py'),
                 '-i', proc_dir,
                 '-t', str(args.threads),
-                '--max-indels',    str(args.max_indels),
-                '--max-indel-len', str(args.max_indel_len),
-                '--min-pctsim',    str(b_min_pctsim),
+                '--max-indels',         str(args.max_indels),
+                '--max-indel-len',      str(args.max_indel_len),
+                '--max-loop-indels',    str(args.max_loop_indels),
+                '--max-loop-indel-len', str(args.max_loop_indel_len),
+                '--min-pctsim',         str(b_min_pctsim),
                 '--mm-iters',      str(args.mm_iters),
                 '--ccd-iters',     str(args.ccd_iters),
                 '--ccd-tol',       str(args.ccd_tol),

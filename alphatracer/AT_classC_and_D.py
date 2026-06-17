@@ -1510,7 +1510,9 @@ def main():
                 continue
             try:
                 st = gemmi.read_structure(src_pdb)
-                poly = [r for r in st[0][0] if r.entity_type == gemmi.EntityType.Polymer]
+                # ESM PDBs have no ENTITY records so entity_type is Unknown;
+                # just take all residues in the first chain.
+                poly = list(st[0][0])
                 _ref_poly_cache[ph] = poly
             except Exception:
                 pass

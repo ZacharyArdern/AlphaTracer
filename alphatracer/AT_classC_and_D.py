@@ -1454,11 +1454,15 @@ def main():
           f'({len(merged)} sequences, pae-step={args.pae_step}, threads={args.threads})...')
 
     rows_by_afdb = {}
+    esm_rows_list = []
     for row in merged.iter_rows(named=True):
         aid = _A.get_afdb_id(row['sseqid'])
-        rows_by_afdb.setdefault(aid, []).append(row)
+        if aid:
+            rows_by_afdb.setdefault(aid, []).append(row)
+        else:
+            esm_rows_list.append(row)
 
-    all_afdb_ids = {aid for aid in rows_by_afdb if aid is not None}
+    all_afdb_ids = set(rows_by_afdb.keys())
 
     # Phase 2a: Download all PAE files in parallel
     print('  [2a] Downloading PAE files...')
@@ -1484,6 +1488,32 @@ def main():
         for aid, poly in ex.map(_load_ref_poly, sorted(all_afdb_ids)):
             if poly is not None:
                 _ref_poly_cache[aid] = poly
+
+    # Phase 2b-ESM: Fetch ESM Atlas PDBs and load ref_poly
+    if esm_rows_list:
+        print(f'  [2b-ESM] Fetching {len(esm_rows_list)} ESM Atlas structure(s)...')
+        _B._fetch_esm_pdbs_classB(
+            [{'protein_hash': r.get('protein_hash') or r['sseqid'].split('|')[0],
+              'fragment_id':  r.get('fragment_id', -1),
+              'frag_row':     r.get('frag_row', -1)}
+             for r in esm_rows_list],
+            pdb_dir, n_workers=args.threads,
+        )
+        seen_ph = set()
+        for row in esm_rows_list:
+            ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
+            if ph in seen_ph or ph in _ref_poly_cache:
+                continue
+            seen_ph.add(ph)
+            src_pdb = _B._esm_local_pdb(ph, pdb_dir)
+            if not os.path.exists(src_pdb):
+                continue
+            try:
+                st = gemmi.read_structure(src_pdb)
+                poly = [r for r in st[0][0] if r.entity_type == gemmi.EntityType.Polymer]
+                _ref_poly_cache[ph] = poly
+            except Exception:
+                pass
 
     # Phase 2c: Batch Rust parse with adaptive step size
     # Small proteins (file < ~350 KB, n ≲ 300): step=2 (Jacc ~0.91, safe)
@@ -1524,6 +1554,27 @@ def main():
                         pass
 
     # Phase 3: Threaded domain detection + qualification using pre-parsed matrices
+    def _qualify_esm_row(row):
+        """Qualify an ESM Atlas hit without PAE: use whole reference as one domain,
+        skip E-rejection (no PAE clustering to produce sub-domains), apply identity window."""
+        ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
+        ref_poly = _ref_poly_cache.get(ph)
+        if ref_poly is None:
+            return None, 'no_pdb'
+        domain = list(range(len(ref_poly)))
+        if len(domain) < args.min_domain_size:
+            return None, 'domain_too_small'
+        _, ops      = _B.parse_alignment_ops(row['qseq_alg'], row['sseq_alg'])
+        rp_to_comp  = _ref_pos_to_comp(row['qseq_alg'], row['sseq_alg'], row['alg_comp'])
+        domain_set  = set(domain)
+        d_ops       = _domain_ops(domain_set, ops)
+        if not d_ops:
+            return None, 'no_domain'
+        comp = _domain_comp_str(domain_set, d_ops, rp_to_comp)
+        if not _A.all_windows_pass(comp, args.window_size, threshold_frac):
+            return None, 'no_domain'
+        return {**row, '_best_domain': domain}, 'ok'
+
     def _qualify_row(row, ref_poly, n_full, pae_matrix, step):
         _, ops     = _B.parse_alignment_ops(row['qseq_alg'], row['sseq_alg'])
         rp_to_comp = _ref_pos_to_comp(row['qseq_alg'], row['sseq_alg'], row['alg_comp'])
@@ -1569,8 +1620,13 @@ def main():
         for fut in as_completed(futures):
             qual_results.extend(fut.result())
 
+    # ESM Atlas rows: qualify without PAE (threaded, CPU-only)
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        for result in ex.map(_qualify_esm_row, esm_rows_list):
+            qual_results.append(result)
+
     classC_rows = []
-    n_qualify = n_no_pae = n_no_domain = n_too_small = n_low_plddt = 0
+    n_qualify = n_no_pae = n_no_domain = n_too_small = n_low_plddt = n_no_pdb = 0
     for result_row, status in qual_results:
         if status == 'ok':
             classC_rows.append(result_row)
@@ -1583,6 +1639,8 @@ def main():
             n_too_small += 1
         elif status == 'domain_low_plddt':
             n_low_plddt += 1
+        elif status == 'no_pdb':
+            n_no_pdb += 1
 
     print(f'  Qualifying:         {n_qualify}')
     print(f'  No PAE file:        {n_no_pae}')
@@ -1591,6 +1649,8 @@ def main():
         print(f'  Domain too small:   {n_too_small}  (<{args.min_domain_size} residues → Class D)')
     if n_low_plddt:
         print(f'  Domain low pLDDT:   {n_low_plddt}  (<{args.min_domain_plddt:.0f} mean → Class D)')
+    if n_no_pdb:
+        print(f'  No PDB (ESM):       {n_no_pdb}')
 
     classC_ids = {r['qseqid'] for r in classC_rows}
 
@@ -1623,7 +1683,11 @@ def main():
             return qseqid, True, None, 0.0, len(best_domain), True  # cached
 
         afdb_id = _A.get_afdb_id(row['sseqid'])
-        ref_poly = _ref_poly_cache.get(afdb_id)
+        if afdb_id:
+            ref_poly = _ref_poly_cache.get(afdb_id)
+        else:
+            ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
+            ref_poly = _ref_poly_cache.get(ph)
         if ref_poly is None:
             return qseqid, False, 'ref PDB not found', 0.0, 0, False
         _, ops = _B.parse_alignment_ops(row['qseq_alg'], row['sseq_alg'])

@@ -153,7 +153,7 @@ _ESM_DIR = os.environ.get('AT_ESM_DIR',
                             '..', '..', '..', '..', 'Data', 'ESMAtlas'))
 
 
-def _fetch_esm_pdbs_classB(esm_rows, pdb_dir, n_workers=8):
+def _fetch_esm_pdbs_classB(esm_rows, pdb_dir, n_workers=8, pae_dir=None):
     """Batch-fetch ESM Atlas structure blobs from Lance and write as PDB files."""
     esm_dir = os.path.abspath(_ESM_DIR)
     if esm_dir not in sys.path:
@@ -197,30 +197,68 @@ def _fetch_esm_pdbs_classB(esm_rows, pdb_dir, n_workers=8):
     if not hits:
         return
 
-    print(f'  Fetching {len(hits)} ESM Atlas structure(s) from S3...', flush=True)
-    t0 = time.time()
-    try:
-        results = _esm.query_from_hits(hits, columns=['protein_hash', 'structure_blob'],
-                                        n_workers=n_workers)
-    except Exception as e:
-        print(f'  [WARN] ESM Atlas fetch failed: {type(e).__name__}: {e}')
-        return
+    fetch_pae = pae_dir is not None
+    cols = ['protein_hash', 'structure_blob', 'pae'] if fetch_pae else ['protein_hash', 'structure_blob']
+    if fetch_pae:
+        os.makedirs(pae_dir, exist_ok=True)
 
-    n_written = 0
+    print(f'  Fetching {len(hits)} ESM Atlas structure(s) from S3'
+          f'{" + PAE" if fetch_pae else ""}...', flush=True)
+    t0 = time.time()
+
+    if fetch_pae:
+        # Use Lance directly to fetch structure_blob + pae in one round-trip per fragment
+        import io as _io, zipfile as _zf, pyarrow as _pa, numpy as _np
+        from collections import defaultdict as _dd
+        try:
+            ds = _esm._get_dataset()
+            by_frag = _dd(list)
+            for h in hits:
+                by_frag[h['fragment_id']].append(h['fragment_id'] * 10000 + h['frag_row'])
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            with _TPE(max_workers=n_workers) as exe:
+                tables = list(exe.map(
+                    lambda ids: ds.take(ids, columns=cols), by_frag.values()
+                ))
+            results = _pa.concat_tables(tables)
+        except Exception as e:
+            print(f'  [WARN] ESM Atlas Lance fetch failed: {type(e).__name__}: {e}')
+            return
+    else:
+        try:
+            results = _esm.query_from_hits(hits, columns=cols, n_workers=n_workers)
+        except Exception as e:
+            print(f'  [WARN] ESM Atlas fetch failed: {type(e).__name__}: {e}')
+            return
+
+    n_pdb = n_pae = 0
     for batch in results.to_batches():
         hashes = batch['protein_hash'].to_pylist()
         blobs  = batch['structure_blob'].to_pylist()
-        for ph, blob in zip(hashes, blobs):
+        paes   = batch['pae'].to_pylist() if fetch_pae else [None] * len(hashes)
+        for ph, blob, pae_bytes in zip(hashes, blobs, paes):
             pdb_path = _esm_local_pdb(ph, pdb_dir)
-            try:
-                with open(pdb_path, 'w') as f:
-                    f.write(_esm.blob_to_pdb(blob))
-                n_written += 1
-            except Exception as e:
-                print(f'  [WARN] ESM Atlas decode failed for {ph}: {e}')
+            if blob is not None:
+                try:
+                    with open(pdb_path, 'w') as f:
+                        f.write(_esm.blob_to_pdb(blob))
+                    n_pdb += 1
+                except Exception as e:
+                    print(f'  [WARN] ESM Atlas decode failed for {ph}: {e}')
+            if fetch_pae and pae_bytes is not None:
+                npy_path = os.path.join(pae_dir, f'esm_{ph}.pae.npy')
+                try:
+                    with _zf.ZipFile(_io.BytesIO(pae_bytes)) as zf:
+                        arr = _np.load(_io.BytesIO(zf.read(zf.namelist()[0])))
+                    _np.save(npy_path, arr.astype(_np.float32) / 8.0)
+                    n_pae += 1
+                except Exception as e:
+                    print(f'  [WARN] ESM PAE decode failed for {ph}: {e}')
 
-    print(f'  Fetched {n_written}/{len(hits)} ESM Atlas structure(s) in {time.time()-t0:.1f}s',
-          flush=True)
+    msg = f'  Fetched {n_pdb}/{len(hits)} ESM structures'
+    if fetch_pae:
+        msg += f', {n_pae}/{len(hits)} PAE matrices'
+    print(msg + f' in {time.time()-t0:.1f}s', flush=True)
 
 
 def _is_valid_pdb(path):

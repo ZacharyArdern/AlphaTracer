@@ -1576,7 +1576,7 @@ def main():
               'fragment_id':  r.get('fragment_id', -1),
               'frag_row':     r.get('frag_row', -1)}
              for r in esm_rows_list],
-            pdb_dir, n_workers=args.threads,
+            pdb_dir, n_workers=args.threads, pae_dir=pae_dir,
         )
         seen_ph = set()
         for row in esm_rows_list:
@@ -1633,6 +1633,25 @@ def main():
                         pae_matrices_by_afdb[aid] = (pae.shape[0], pae.astype('float32'), 1)
                     except Exception:
                         pass
+
+    # Load ESM PAE npy files (written by _fetch_esm_pdbs_classB with pae_dir)
+    n_esm_pae = 0
+    seen_esm_ph = set()
+    for row in esm_rows_list:
+        ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
+        if ph in seen_esm_ph or ph in pae_matrices_by_afdb:
+            continue
+        seen_esm_ph.add(ph)
+        npy_path = os.path.join(pae_dir, f'esm_{ph}.pae.npy')
+        if os.path.exists(npy_path):
+            try:
+                mat = np.load(npy_path).astype(np.float32)
+                pae_matrices_by_afdb[ph] = (mat.shape[0], mat, 1)
+                n_esm_pae += 1
+            except Exception:
+                pass
+    if esm_rows_list:
+        print(f'  ESM PAE loaded: {n_esm_pae}/{len(seen_esm_ph)} matrices')
 
     # Phase 3: Threaded domain detection + qualification using pre-parsed matrices
     def _qualify_esm_row(row):
@@ -1701,9 +1720,20 @@ def main():
         for fut in as_completed(futures):
             qual_results.extend(fut.result())
 
-    # ESM Atlas rows: qualify without PAE (threaded, CPU-only)
+    # ESM Atlas rows: use PAE domain detection if available, else whole-structure fallback
+    def _qualify_esm_dispatch(row):
+        ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
+        pae_data = pae_matrices_by_afdb.get(ph)
+        if pae_data is not None:
+            ref_poly = _ref_poly_cache.get(ph)
+            if ref_poly is None:
+                return None, 'no_pdb'
+            n_full, pae_matrix, step = pae_data
+            return _qualify_row(row, ref_poly, n_full, pae_matrix, step)
+        return _qualify_esm_row(row)
+
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
-        for result in ex.map(_qualify_esm_row, esm_rows_list):
+        for result in ex.map(_qualify_esm_dispatch, esm_rows_list):
             qual_results.append(result)
 
     classC_rows = []

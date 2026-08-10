@@ -293,6 +293,9 @@ def parse_args() -> argparse.Namespace:
                         choices=['ccd', 'promod3'],
                         help='Loop closing backend: ccd (default) or promod3 '
                              '(fragment DB + CCD, requires OST/ProMod3)')
+    shared.add_argument('--full-pdbs', action='store_true', default=False,
+                        help='Class B: build full backbone (N/CA/C/O/CB) with CCD + OpenMM. '
+                             'Default is CA-only trace (faster, no minimisation).')
     shared.add_argument('--promod3-data-dir', default=None,
                         help='ProMod3 database directory '
                              '(default: $PROMOD3_SHARED_DATA_PATH or '
@@ -428,11 +431,8 @@ def main() -> None:
     print('AlphaTracer  —  Full Pipeline Wrapper')
     print('=' * 60)
     search_method = 'diamond' if args.diamond else 'kmer'
-    # kmer approx_pident is Jaccard-based and systematically lower than NW
-    # identity; pass threshold=1 to the pre-NW filter and let Class B/C apply
-    # the real threshold after NW alignment instead.
-    b_min_pctsim  = args.b_min_pctsim if args.diamond else 1
-    c_min_pctsim  = args.c_min_pctsim if args.diamond else 1
+    b_min_pctsim  = args.b_min_pctsim
+    c_min_pctsim  = args.c_min_pctsim
 
     print(f'  Input:        {args.input}  ({total_seqs} sequences)')
     print(f'  DB dir:       {dbdir}')
@@ -503,6 +503,7 @@ def main() -> None:
                     '--ccd-tol',       str(args.ccd_tol),
                     '--flank',         str(args.flank),
                     '--loop-closer',   args.loop_closer,
+                    *(['--full-pdbs'] if args.full_pdbs else []),
                     *_flag('--promod3-data-dir', args.promod3_data_dir),
                     *_flag('--limit', args.b_limit),
                 ]
@@ -555,6 +556,7 @@ def main() -> None:
                     '--ccd-tol',       str(args.ccd_tol),
                     '--flank',         str(args.flank),
                     '--loop-closer',   args.loop_closer,
+                    *(['--full-pdbs'] if args.full_pdbs else []),
                     *_flag('--promod3-data-dir', args.promod3_data_dir),
                     *_flag('--limit', args.b_limit),
                 ]
@@ -617,6 +619,7 @@ def main() -> None:
                 '--ccd-tol',       str(args.ccd_tol),
                 '--flank',         str(args.flank),
                 '--loop-closer',   args.loop_closer,
+                *(['--full-pdbs'] if args.full_pdbs else []),
                 *_flag('--promod3-data-dir', args.promod3_data_dir),
                 *_flag('--limit', args.b_limit),
             ]

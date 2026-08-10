@@ -12,7 +12,7 @@ use std::time::Instant;
 
 const N_HASH: usize = 100; // v1 default; overridden by v2 header
 const CHUNK: usize = 100_000;
-const DEFAULT_K: usize = 9;
+const DEFAULT_K: usize = 11; // must match index_seqs.rs DEFAULT_K
 const MAX_FREQ: usize = 500;
 const TOP_K: usize = 5;
 const MIN_SHARED: u32 = 2;
@@ -118,6 +118,7 @@ fn read_varint(data: &[u8], pos: &mut usize) -> u32 {
         v |= ((b & 0x7F) as u32) << shift;
         if b & 0x80 == 0 { break; }
         shift += 7;
+        if shift >= 32 { break; } // guard against corrupt index
     }
     v
 }
@@ -137,19 +138,21 @@ fn load_sidx_v2(path: &str) -> V2Index {
     let _max_freq = read_u32!();
     let n_hash    = read_u32!() as usize;
 
-    // hash_keys — zero-copy slice into mmap'd data
-    let hk_start = pos;
-    pos += n_hashes * 4;
-    let hash_keys: &[u32] = unsafe {
-        std::slice::from_raw_parts(data[hk_start..].as_ptr() as *const u32, n_hashes)
-    };
+    // hash_keys — copy out to avoid unaligned pointer cast UB
+    let hk_end = pos + n_hashes * 4;
+    let hash_keys: Vec<u32> = data[pos..hk_end]
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    pos = hk_end;
 
-    // byte offsets — zero-copy slice
-    let off_start = pos;
-    pos += (n_hashes + 1) * 8;
-    let offsets: &[u64] = unsafe {
-        std::slice::from_raw_parts(data[off_start..].as_ptr() as *const u64, n_hashes + 1)
-    };
+    // byte offsets
+    let off_end = pos + (n_hashes + 1) * 8;
+    let offsets: Vec<u64> = data[pos..off_end]
+        .chunks_exact(8)
+        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+    pos = off_end;
 
     // encoded block starts here; offsets are relative to enc_base
     let enc_base = pos as u64;
@@ -172,9 +175,8 @@ fn load_sidx_v2(path: &str) -> V2Index {
     V2Index { mmap, inv, n_hash, n_seqs, id_lens_offset, id_bytes_start }
 }
 
-fn load_sidx_v1(path: &str) -> (Vec<String>, FxHashMap<u32, Vec<u32>>) {
-    let raw = std::fs::read(path).expect("read .sidx");
-    let data: &'static [u8] = Box::leak(raw.into_boxed_slice());
+fn load_sidx_v1(path: &str) -> (Vec<String>, FxHashMap<u32, Vec<u32>>, usize) {
+    let data = std::fs::read(path).expect("read .sidx");
 
     let mut pos = 9usize;
     macro_rules! read_u32 { () => {{ let v = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()); pos += 4; v }} }
@@ -184,30 +186,34 @@ fn load_sidx_v1(path: &str) -> (Vec<String>, FxHashMap<u32, Vec<u32>>) {
     let n_hashes   = read_u64!() as usize;
     let n_postings = read_u64!() as usize;
     let _max_freq  = read_u32!();
-    let _n_hash_c  = read_u32!();
+    let n_hash_c   = read_u32!() as usize;
 
-    let hk_start = pos; pos += n_hashes * 4;
-    let hash_keys: &[u32] = unsafe { std::slice::from_raw_parts(data[hk_start..].as_ptr() as *const u32, n_hashes) };
+    let hash_keys: Vec<u32> = data[pos..pos + n_hashes * 4]
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    pos += n_hashes * 4;
 
-    let off_start = pos; pos += (n_hashes + 1) * 8;
-    let offsets: &[u64] = unsafe { std::slice::from_raw_parts(data[off_start..].as_ptr() as *const u64, n_hashes + 1) };
+    let offsets: Vec<u64> = data[pos..pos + (n_hashes + 1) * 8]
+        .chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).collect();
+    pos += (n_hashes + 1) * 8;
 
-    let post_start = pos; pos += n_postings * 4;
-    let postings_raw: &[u32] = unsafe { std::slice::from_raw_parts(data[post_start..].as_ptr() as *const u32, n_postings) };
+    let postings_raw: Vec<u32> = data[pos..pos + n_postings * 4]
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
+    pos += n_postings * 4;
 
     let mut inverted: FxHashMap<u32, Vec<u32>> = FxHashMap::with_capacity_and_hasher(n_hashes, Default::default());
     for i in 0..n_hashes {
         inverted.insert(hash_keys[i], postings_raw[offsets[i] as usize..offsets[i+1] as usize].to_vec());
     }
 
-    let id_lens: &[u32] = unsafe { std::slice::from_raw_parts(data[pos..].as_ptr() as *const u32, n_seqs) };
+    let id_lens: Vec<u32> = data[pos..pos + n_seqs * 4]
+        .chunks_exact(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect();
     pos += n_seqs * 4;
     let mut db_ids = Vec::with_capacity(n_seqs);
-    for &len in id_lens {
+    for &len in &id_lens {
         db_ids.push(std::str::from_utf8(&data[pos..pos + len as usize]).unwrap().to_string());
         pos += len as usize;
     }
-    (db_ids, inverted)
+    (db_ids, inverted, n_hash_c)
 }
 
 fn load_parquet(path: &str, max_freq: usize) -> (Vec<String>, FxHashMap<u32, Vec<u32>>) {
@@ -404,7 +410,7 @@ fn main() {
         println!("query\ttarget\tshared\tjaccard");
         for (qi, hits) in results.iter().enumerate() {
             for &(shared, seq_idx) in hits {
-                let jaccard = shared as f64 / (n_hash * 2 - shared as usize) as f64;
+                let jaccard = shared as f64 / n_hash_search as f64;
                 let target = id_map.get(&seq_idx).map(|s| s.as_str()).unwrap_or("?");
                 println!("{}\t{}\t{}\t{:.4}", query_ids[qi], target, shared, jaccard);
             }
@@ -412,10 +418,10 @@ fn main() {
     } else {
         // ── Eager path (v1 sidx or parquet) ───────────────────────────────────
         let (db_ids, inv, n_hash) = if is_sidx {
-            let (db_ids, inv) = load_sidx_v1(db_path);
+            let (db_ids, inv, n_hash_c) = load_sidx_v1(db_path);
             eprintln!("Index loaded: {} seqs, {} hashes  ({:.1}s)",
                       db_ids.len(), inv.len(), t0.elapsed().as_secs_f64());
-            (db_ids, inv, N_HASH)
+            (db_ids, inv, n_hash_c)
         } else {
             let (db_ids, inv) = load_parquet(db_path, max_freq);
             eprintln!("Index: {} seqs, {} hashes  ({:.1}s)",
@@ -443,7 +449,7 @@ fn main() {
         println!("query\ttarget\tshared\tjaccard");
         for (qi, hits) in results.iter().enumerate() {
             for &(shared, seq_idx) in hits {
-                let jaccard = shared as f64 / (n_hash * 2 - shared as usize) as f64;
+                let jaccard = shared as f64 / n_hash_search as f64;
                 println!("{}\t{}\t{}\t{:.4}", query_ids[qi], ids[seq_idx as usize], shared, jaccard);
             }
         }

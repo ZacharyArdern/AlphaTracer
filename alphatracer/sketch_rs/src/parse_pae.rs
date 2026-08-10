@@ -142,6 +142,8 @@ fn parse_row_sparse(row: &[u8], step: usize, n: usize, out: &mut Vec<f32>) {
         } else if b.is_ascii_digit() {
             val = val * 10 + (b - b'0') as u32;
             in_val = true;
+        } else if b == b'.' {
+            // skip decimal part — PAE values are integers but guard against floats
         }
     }
     if in_val && col % step == 0 {

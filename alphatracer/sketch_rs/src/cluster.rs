@@ -22,7 +22,6 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-const N_HASH: usize = 100;
 const U32_MAX: u32 = u32::MAX;
 const READ_BATCH: usize = 100_000;
 const GROUP_BUFFER: usize = 8_000; // groups dispatched to rayon at a time
@@ -353,21 +352,26 @@ fn main() {
         let sk_batch  = sk_batch_res.unwrap();
         let nr        = seq_batch.num_rows();
 
-        // Verify alignment
+        // Verify alignment — check row count and first+last IDs in the batch
+        assert_eq!(seq_batch.num_rows(), sk_batch.num_rows(),
+            "Batch size mismatch between seq and sketch parquets ({} vs {})",
+            seq_batch.num_rows(), sk_batch.num_rows());
         let seq_ids = col_strings(&seq_batch, "AFDB_ID");
         let sk_ids  = col_strings(&sk_batch,  "AFDB_ID");
-        assert_eq!(seq_ids[0], sk_ids[0], "Row order mismatch between seq and sketch parquets");
+        assert_eq!(seq_ids[0], sk_ids[0], "Row order mismatch between seq and sketch parquets (first row)");
+        assert_eq!(seq_ids[nr - 1], sk_ids[nr - 1], "Row order mismatch between seq and sketch parquets (last row)");
 
         let fns  = col_strings(&seq_batch, "function");
         let fams = col_strings(&seq_batch, "family");
         let seqs = col_strings(&seq_batch, "sequence");
 
-        // Extract sketch flat values
-        let sk_col  = sk_batch.column_by_name("sketch").unwrap();
-        let sk_fsl  = sk_col.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
-        let sk_vals = sk_fsl.values();
-        let sk_u32  = sk_vals.as_any().downcast_ref::<UInt32Array>().unwrap();
-        let sk_flat = sk_u32.values(); // flat &[u32], length = nr * N_HASH
+        // Extract sketch flat values — read stride from parquet, don't assume N_HASH
+        let sk_col    = sk_batch.column_by_name("sketch").unwrap();
+        let sk_fsl    = sk_col.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+        let sk_stride = sk_fsl.value_length() as usize;
+        let sk_vals   = sk_fsl.values();
+        let sk_u32    = sk_vals.as_any().downcast_ref::<UInt32Array>().unwrap();
+        let sk_flat   = sk_u32.values(); // flat &[u32], length = nr * sk_stride
 
         for i in 0..nr {
             let fn_  = fns[i].as_str();
@@ -400,9 +404,9 @@ fn main() {
             let seq  = seqs[i].trim_end_matches('*');
             let len_ = seq.len() as u32;
 
-            // Sketch: slice from flat buffer, filter U32_MAX, already sorted
-            let base = i * N_HASH;
-            let sk: Vec<u32> = sk_flat[base..base + N_HASH]
+            // Sketch: slice from flat buffer using actual stride, filter U32_MAX
+            let base = i * sk_stride;
+            let sk: Vec<u32> = sk_flat[base..base + sk_stride]
                 .iter()
                 .copied()
                 .filter(|&h| h != U32_MAX)

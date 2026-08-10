@@ -27,14 +27,24 @@ path = "src/cluster.rs"
 name = "parse-pae"
 path = "src/parse_pae.rs"
 
+[[bin]]
+name = "bench-kmer"
+path = "src/bench_kmer.rs"
+
+[[bin]]
+name = "bench-hnsw"
+path = "src/bench_hnsw.rs"
+
 [dependencies]
+kmerutils = "0.0.14"
+hnsw_rs = "0.3"
 rayon = "1"
 parquet = { version = "55", features = ["arrow"] }
 arrow-array = "55"
 arrow-schema = "55"
 arrow-cast = "55"
 rustc-hash = "2"
-needletail = "0.5"
+needletail = "0.6"
 memmap2 = "0.9"
 
 [profile.release]

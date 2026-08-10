@@ -25,13 +25,14 @@ import io
 import sys
 import time
 import argparse
+import asyncio
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import aiohttp
 import numpy as np
 import polars as pl
 import parasail
-import pycurl
 import gemmi
 from openmm import (System, HarmonicBondForce, HarmonicAngleForce,
                     PeriodicTorsionForce, LangevinMiddleIntegrator, Platform)
@@ -121,6 +122,11 @@ def parse_args():
                    help='ProMod3 database directory (overrides PROMOD3_SHARED_DATA_PATH)')
     p.add_argument('--limit',         type=int,   default=0,
                    help='Process only first N Class B structures (0 = all)')
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument('--c-alpha', action='store_true', default=False,
+                      help='Output CA-only trace (no CCD, no OpenMM). Default mode.')
+    mode.add_argument('--full-pdbs', action='store_true', default=False,
+                      help='Output full backbone (N/CA/C/O/CB) with CCD and OpenMM minimisation.')
     return p.parse_args()
 
 
@@ -144,7 +150,7 @@ def _esm_local_pdb(protein_hash, pdb_dir):
 _HAS_DB_TYPE = False  # overridden at runtime by auto-detection from allhits.pq
 _ESM_DIR = os.environ.get('AT_ESM_DIR',
                os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            '..', '..', '..', 'Data', 'ESMAtlas'))
+                            '..', '..', '..', '..', 'Data', 'ESMAtlas'))
 
 
 def _fetch_esm_pdbs_classB(esm_rows, pdb_dir, n_workers=8):
@@ -158,17 +164,35 @@ def _fetch_esm_pdbs_classB(esm_rows, pdb_dir, n_workers=8):
         print(f'  [WARN] Cannot import esm_query from {esm_dir} — ESM Atlas hits will be skipped')
         return
 
-    hits = []
-    seen = set()
+    # Collect protein_hashes; resolve fragment coords via lookup_hashes if missing.
+    hits, need_lookup, seen = [], [], set()
     for row in esm_rows:
         ph  = row.get('protein_hash') or ''
         fid = row.get('fragment_id', -1)
         fr  = row.get('frag_row', -1)
-        if not ph or fid < 0 or fr < 0 or ph in seen:
+        if not ph or ph in seen:
             continue
         seen.add(ph)
-        if not os.path.exists(_esm_local_pdb(ph, pdb_dir)):
+        if os.path.exists(_esm_local_pdb(ph, pdb_dir)):
+            continue
+        if fid is not None and fid >= 0 and fr is not None and fr >= 0:
             hits.append({'fragment_id': fid, 'frag_row': fr, 'protein_hash': ph})
+        else:
+            need_lookup.append(ph)
+
+    if need_lookup:
+        print(f'  Resolving {len(need_lookup)} ESM protein_hash(es) via local index...', flush=True)
+        try:
+            idx = _esm.lookup_hashes(need_lookup)
+            for ph, fid, fr in zip(idx['protein_hash'].to_pylist(),
+                                    idx['fragment_id'].to_pylist(),
+                                    idx['frag_row'].to_pylist()):
+                if fid >= 0 and fr >= 0:
+                    hits.append({'fragment_id': int(fid), 'frag_row': int(fr), 'protein_hash': ph})
+                else:
+                    print(f'  [WARN] No index entry for ESM protein_hash {ph} — skipping', flush=True)
+        except Exception as e:
+            print(f'  [WARN] ESM lookup_hashes failed: {e}', flush=True)
 
     if not hits:
         return
@@ -429,6 +453,169 @@ def build_helix_residue(prev_N, prev_CA, prev_C, resname):
     return atoms
 
 
+def build_residue_from_angles(prev_N, prev_CA, prev_C, resname, phi, psi):
+    """Build one residue using explicit phi/psi angles (radians)."""
+    N  = place_atom(prev_N,  prev_CA, prev_C, _BL['C-N'],  _BA['CA-C-N'], psi)
+    CA = place_atom(prev_CA, prev_C,  N,      _BL['N-CA'], _BA['C-N-CA'], _OMEGA)
+    C  = place_atom(prev_C,  N,       CA,     _BL['CA-C'], _BA['N-CA-C'], phi)
+    O  = place_atom(N,       CA,      C,      _BL['C-O'],  _BA['CA-C-O'], np.pi)
+    atoms = {'N': N, 'CA': CA, 'C': C, 'O': O}
+    if resname != 'GLY':
+        atoms['CB'] = place_atom(prev_C, N, CA, _BL['CA-CB'], _BA['N-CA-CB'],
+                                 np.deg2rad(-121.5))
+    return atoms
+
+
+# beta-bulge phi/psi for 1- and 2-residue insertions in strand context
+# Classic bulge geometry from Richardson 1981 / Wouters & Curmi 1995
+_BULGE_1 = [(-100.0,  30.0)]                          # Δ=1: one bulge residue
+_BULGE_2 = [(-100.0, 120.0), (-130.0, 130.0)]         # Δ=2: classic bulge pair
+
+
+def build_directed_residues(prev_N, prev_CA, prev_C, aas, target_N, ss_ctx='C'):
+    """Build insertion residues aiming each CA along the straight-line path toward
+    target_N.  Uses a 1-D scan over psi (fine grid) to choose N placement, which
+    exactly determines CA given omega=180°.  phi is then chosen to minimise the
+    C-to-target distance for the last residue, or set to strand/helix default.
+
+    Returns list of (resname, atoms) tuples.
+    """
+    pN, pCA, pC = np.asarray(prev_N), np.asarray(prev_CA), np.asarray(prev_C)
+    n = len(aas)
+    target = np.asarray(target_N)
+    result = []
+
+    psi_grid = np.deg2rad(np.arange(-180, 180, 2))   # 180 points, fast
+    phi_grid = np.deg2rad(np.arange(-180, 180, 5))   # used only for last residue
+
+    for i, aa in enumerate(aas):
+        rn = ONE_TO_THREE.get(aa, 'ALA')
+        remaining = n - i
+
+        # desired CA: interpolate toward target
+        frac = 1.0 / remaining
+        desired_CA = pCA + frac * (target - pCA)
+
+        # scan psi to place N (and thus CA) closest to desired_CA
+        # CA position depends only on psi (N position) since omega is fixed
+        best_psi, best_d_ca = _PSI_EXT, np.inf
+        for psi in psi_grid:
+            N_try = place_atom(pN, pCA, pC, _BL['C-N'], _BA['CA-C-N'], psi)
+            CA_try = place_atom(pCA, pC, N_try, _BL['N-CA'], _BA['C-N-CA'], _OMEGA)
+            d = np.linalg.norm(CA_try - desired_CA)
+            if d < best_d_ca:
+                best_d_ca, best_psi = d, psi
+
+        # for phi: on the last residue scan to minimise C-to-target; elsewhere use default
+        if remaining == 1:
+            best_phi, best_d_c = _PHI_EXT, np.inf
+            N_best = place_atom(pN, pCA, pC, _BL['C-N'], _BA['CA-C-N'], best_psi)
+            CA_best = place_atom(pCA, pC, N_best, _BL['N-CA'], _BA['C-N-CA'], _OMEGA)
+            for phi in phi_grid:
+                C_try = place_atom(pC, N_best, CA_best, _BL['CA-C'], _BA['N-CA-C'], phi)
+                d = np.linalg.norm(C_try - target)
+                if d < best_d_c:
+                    best_d_c, best_phi = d, phi
+        else:
+            best_phi = _PHI_HELIX if ss_ctx == 'H' else _PHI_EXT
+
+        atoms = build_residue_from_angles(pN, pCA, pC, rn, best_phi, best_psi)
+        result.append((rn, atoms))
+        pN, pCA, pC = atoms['N'], atoms['CA'], atoms['C']
+
+    return result
+
+
+# ── Numerical tripeptide closure ──────────────────────────────────────────────
+
+def _tripeptide_close(prev_N, prev_CA, prev_C, aas, target_N, n_solutions=8):
+    """Minimise gap between C of last residue and target_N over 6 torsion DOF.
+
+    Uses multi-start L-BFGS-B; returns (list of (resname, atoms), gap_Å) or
+    (None, gap_Å) if best gap > 2 Å.
+    """
+    from scipy.optimize import minimize
+
+    assert len(aas) == 3
+    resnames = [ONE_TO_THREE.get(aa, 'ALA') for aa in aas]
+    target = np.asarray(target_N)
+
+    pN0, pCA0, pC0 = np.asarray(prev_N), np.asarray(prev_CA), np.asarray(prev_C)
+
+    def build_chain(x):
+        phi1, psi1, phi2, psi2, phi3, psi3 = x
+        a1 = build_residue_from_angles(pN0, pCA0, pC0, resnames[0], phi1, psi1)
+        a2 = build_residue_from_angles(a1['N'], a1['CA'], a1['C'], resnames[1], phi2, psi2)
+        a3 = build_residue_from_angles(a2['N'], a2['CA'], a2['C'], resnames[2], phi3, psi3)
+        return a1, a2, a3
+
+    def residual(x):
+        _, _, a3 = build_chain(x)
+        return float(np.sum((a3['C'] - target) ** 2))
+
+    rng = np.random.default_rng(42)
+    starts = [
+        np.array([_PHI_EXT,   _PSI_EXT]   * 3),
+        np.array([_PHI_HELIX, _PSI_HELIX] * 3),
+        np.array([_PHI_EXT,   _PSI_HELIX, _PHI_EXT,   _PSI_EXT,   _PHI_EXT,   _PSI_EXT]),
+        np.array([_PHI_HELIX, _PSI_EXT,   _PHI_HELIX, _PSI_HELIX, _PHI_EXT,   _PSI_EXT]),
+    ]
+    starts += [rng.uniform(-np.pi, np.pi, 6) for _ in range(n_solutions - 4)]
+
+    best_res, best_x = np.inf, None
+    for x0 in starts:
+        r = minimize(residual, x0, method='L-BFGS-B',
+                     options={'maxiter': 500, 'ftol': 1e-14, 'gtol': 1e-9})
+        if r.fun < best_res:
+            best_res, best_x = r.fun, r.x
+
+    gap = np.sqrt(best_res)
+    if best_x is None or gap > 2.0:
+        return None, gap
+
+    a1, a2, a3 = build_chain(best_x)
+    return [(resnames[0], a1), (resnames[1], a2), (resnames[2], a3)], gap
+
+
+def tripeptide_close_insertion(prev_N, prev_CA, prev_C, aas, target_N,
+                               ss_ctx='C', n_solutions=8):
+    """Build n≥3 insertion residues using directed geometry + tripeptide closure.
+
+    For n==3: directly optimises all 6 torsions.
+    For n>3: builds first n-3 residues with directed geometry, then tripeptide
+             closure on the last 3.
+
+    Returns (list of (resname, atoms), gap_Å), or (None, gap_Å) on failure.
+    """
+    n = len(aas)
+    if n < 3:
+        return None, 999.
+
+    target = np.asarray(target_N)
+
+    if n == 3:
+        return _tripeptide_close(prev_N, prev_CA, prev_C, aas, target,
+                                 n_solutions=n_solutions)
+
+    pre_aas  = aas[:n - 3]
+    trip_aas = aas[n - 3:]
+
+    pre_residues = build_directed_residues(prev_N, prev_CA, prev_C, pre_aas,
+                                           target, ss_ctx=ss_ctx)
+    if not pre_residues:
+        return None, 999.
+
+    _, last_atoms = pre_residues[-1]
+    pN2, pCA2, pC2 = last_atoms['N'], last_atoms['CA'], last_atoms['C']
+
+    trip_result, gap = _tripeptide_close(pN2, pCA2, pC2, trip_aas, target,
+                                         n_solutions=n_solutions)
+    if trip_result is None:
+        return None, gap
+
+    return pre_residues + trip_result, gap
+
+
 # ── CCD loop closure ──────────────────────────────────────────────────────────
 
 def _rotation_matrix(axis, angle):
@@ -640,6 +827,111 @@ def _get_platform():
         if _PLATFORM is None:
             _PLATFORM = Platform.getPlatformByName('Reference')
     return _PLATFORM
+
+
+# ── CA-only build ────────────────────────────────────────────────────────────
+
+def build_classB_ca_only(row, pdb_dir, out_pdb):
+    """Build a CA-only trace for one Class B protein.
+
+    Matched residues: CA copied directly from reference AFDB structure.
+    Deleted residues: omitted.
+    Inserted residues: CA linearly interpolated between flanking reference CAs.
+
+    Returns (success, error_msg, elapsed_s).
+    """
+    t0 = time.perf_counter()
+    try:
+        qseqid   = row['qseqid']
+        full_qseq = row['full_qseq']
+        qseq_alg = row['qseq_alg']
+        sseq_alg = row['sseq_alg']
+        sseqid   = row['sseqid']
+
+        db_type = row.get('db_type', 'afdb') or 'afdb'
+        if db_type == 'esm_atlas':
+            protein_hash = row.get('protein_hash') or sseqid.split('|')[0]
+            src_pdb = _esm_local_pdb(protein_hash, pdb_dir)
+            if not os.path.exists(src_pdb):
+                return False, f'ESM Atlas PDB not cached ({protein_hash})', 0.
+        else:
+            afdb_id = get_afdb_id(sseqid)
+            if afdb_id is None:
+                return False, f'cannot parse AFDB id from "{sseqid}"', 0.
+            src_pdb = afdb_local_pdb(afdb_id, pdb_dir)
+            if not os.path.exists(src_pdb):
+                return False, f'source PDB not found ({afdb_id})', 0.
+
+        _, ops = parse_alignment_ops(qseq_alg, sseq_alg)
+
+        st = gemmi.read_structure(src_pdb)
+        if db_type == 'esm_atlas':
+            st.setup_entities()
+        ref_ch   = st[0]['A']
+        ref_poly = [r for r in ref_ch if r.entity_type == gemmi.EntityType.Polymer]
+
+        def _get_ca(res):
+            try:
+                a = res.find_atom('CA', '\0')
+                if a:
+                    return np.array([a.pos.x, a.pos.y, a.pos.z])
+            except Exception:
+                pass
+            return None
+
+        # First pass: collect entries as ('ref', resname, ca) or ('ins', [aas])
+        entries = []
+        for op in ops:
+            if op[0] == 'match':
+                _, rpos, qaa = op
+                if rpos >= len(ref_poly):
+                    return False, f'ref_pos {rpos} out of range', time.perf_counter() - t0
+                ca = _get_ca(ref_poly[rpos])
+                if ca is None:
+                    return False, f'no CA at ref_pos {rpos}', time.perf_counter() - t0
+                entries.append(('ref', ONE_TO_THREE.get(qaa, 'ALA'), ca))
+            elif op[0] == 'deletion':
+                pass
+            elif op[0] == 'insertion':
+                entries.append(('ins', op[1], None))
+
+        # Second pass: interpolate inserted CA positions
+        cas = []   # final list of (resname, ca_xyz)
+        for i, entry in enumerate(entries):
+            if entry[0] == 'ref':
+                cas.append((entry[1], entry[2]))
+            else:
+                ins_aas = entry[1]
+                n = len(ins_aas)
+                prev_ca = next((entries[j][2] for j in range(i - 1, -1, -1)
+                                if entries[j][0] == 'ref'), None)
+                next_ca = next((entries[j][2] for j in range(i + 1, len(entries))
+                                if entries[j][0] == 'ref'), None)
+                for k, aa in enumerate(ins_aas):
+                    frac = (k + 1) / (n + 1)
+                    if prev_ca is not None and next_ca is not None:
+                        ca = prev_ca + frac * (next_ca - prev_ca)
+                    elif prev_ca is not None:
+                        ca = prev_ca + (k + 1) * np.array([3.8, 0.0, 0.0])
+                    elif next_ca is not None:
+                        ca = next_ca - (n - k) * np.array([3.8, 0.0, 0.0])
+                    else:
+                        ca = np.array([0.0, 0.0, 0.0])
+                    cas.append((ONE_TO_THREE.get(aa, 'ALA'), ca))
+
+        if not cas:
+            return False, 'no residues built', time.perf_counter() - t0
+
+        with open(out_pdb, 'w') as f:
+            for idx, (resname, ca) in enumerate(cas, 1):
+                f.write(f'ATOM  {idx:5d}  CA  {resname} A{idx:4d}    '
+                        f'{ca[0]:8.3f}{ca[1]:8.3f}{ca[2]:8.3f}  1.00  0.00           C\n')
+            f.write('END\n')
+
+        return True, None, time.perf_counter() - t0
+
+    except Exception as e:
+        return False, str(e), time.perf_counter() - t0
 
 
 # ── Per-structure build ───────────────────────────────────────────────────────
@@ -953,39 +1245,39 @@ def stage_download(afdb_ids, pdb_dir, threads):
     if not missing:
         return
 
-    def _fetch(afdb_id):
-        path = afdb_local_pdb(afdb_id, pdb_dir)
-        url  = f'https://alphafold.ebi.ac.uk/files/{os.path.basename(path)}'
-        try:
-            with open(path, 'wb') as f:
-                c = pycurl.Curl(); c.setopt(c.URL, url)
-                c.setopt(c.WRITEDATA, f); c.perform(); c.close()
-            if _is_valid_pdb(path): return f'ok:{afdb_id}'
-            os.remove(path); return f'fail:{afdb_id}:non-PDB'
-        except Exception as e:
-            if os.path.exists(path): os.remove(path)
-            return f'fail:{afdb_id}:{e}'
+    async def _fetch_all(aids):
+        sem = asyncio.Semaphore(64)
+        connector = aiohttp.TCPConnector(limit=64)
 
-    # ── first pass (threaded) ──────────────────────────────────────────────
-    with ThreadPoolExecutor(max_workers=min(32, len(missing))) as ex:
-        futures = {ex.submit(_fetch, aid): aid for aid in missing}
-        results = {}
-        for fut in as_completed(futures):
-            aid = futures[fut]
-            r = fut.result()
-            results[aid] = r
-            if r.startswith('fail'):
-                time.sleep(0.5)
+        async def _fetch_one(session, aid):
+            path = afdb_local_pdb(aid, pdb_dir)
+            url  = f'https://alphafold.ebi.ac.uk/files/{os.path.basename(path)}'
+            async with sem:
+                try:
+                    async with session.get(url) as resp:
+                        data = await resp.read()
+                    with open(path, 'wb') as f:
+                        f.write(data)
+                    if _is_valid_pdb(path):
+                        return aid, f'ok:{aid}'
+                    os.remove(path)
+                    return aid, f'fail:{aid}:non-PDB'
+                except Exception as e:
+                    if os.path.exists(path):
+                        os.remove(path)
+                    return aid, f'fail:{aid}:{e}'
+
+        async with aiohttp.ClientSession(connector=connector) as session:
+            return dict(await asyncio.gather(*[_fetch_one(session, aid) for aid in aids]))
+
+    # ── first pass ────────────────────────────────────────────────────────
+    results = asyncio.run(_fetch_all(missing))
 
     # ── retry failures ─────────────────────────────────────────────────────
     retry = [aid for aid, r in results.items() if r.startswith('fail')]
     if retry:
         print(f'  Retrying {len(retry)} failed download(s)...')
-        for aid in retry:
-            r = _fetch(aid)
-            results[aid] = r
-            if r.startswith('fail'):
-                time.sleep(0.5)
+        results.update(asyncio.run(_fetch_all(retry)))
 
     all_results = list(results.values())
     n_ok = sum(1 for r in all_results if r.startswith('ok'))
@@ -1004,15 +1296,22 @@ def main():
     outdir  = os.path.join(indir, 'output_pdbs_classB')
     os.makedirs(outdir, exist_ok=True)
 
+    ca_only = not args.full_pdbs   # default is CA-only; --full-pdbs opts into full backbone
+
     print('=' * 60)
-    print('AlphaTracer 1.0  —  Class B Pipeline  (CCD + backbone OpenMM)')
+    if ca_only:
+        print('AlphaTracer 1.0  —  Class B Pipeline  (CA-only trace)')
+    else:
+        print('AlphaTracer 1.0  —  Class B Pipeline  (CCD + backbone OpenMM)')
     print('=' * 60)
     print(f'  Input dir:      {indir}/')
+    print(f'  Mode:           {"CA-only (fast)" if ca_only else "full backbone (CCD + OpenMM)"}')
     print(f'  Max indels:     {args.max_indels} (each ≤{args.max_indel_len} aa)  '
           f'| loop relaxed: {args.max_loop_indels} (each ≤{args.max_loop_indel_len} aa)')
-    print(f'  CCD:            {args.ccd_iters} iters, tol={args.ccd_tol} Å, '
-          f'flank={args.flank}')
-    print(f'  OpenMM:         {args.mm_iters} minimisation steps')
+    if not ca_only:
+        print(f'  CCD:            {args.ccd_iters} iters, tol={args.ccd_tol} Å, '
+              f'flank={args.flank}')
+        print(f'  OpenMM:         {args.mm_iters} minimisation steps')
     print()
 
     # ── Load hits ─────────────────────────────────────────────────────────────
@@ -1033,11 +1332,14 @@ def main():
         sys.exit(f'classA.pq not found in {indir}')
     classA_ids = set(pl.read_parquet(classA_path)['qseqid'].to_list())
 
+    _sort_col = 'jaccard' if 'jaccard' in hits_df.columns else 'approx_pident'
+    non_classA = hits_df
+    if 'approx_pident' in hits_df.columns:
+        non_classA = non_classA.filter(pl.col('approx_pident') >= args.min_pctsim)
     non_classA = (
-        hits_df
-        .filter(pl.col('approx_pident') >= args.min_pctsim)
+        non_classA
         .filter(~pl.col('qseqid').is_in(classA_ids))
-        .sort('approx_pident', descending=True)
+        .sort(_sort_col, descending=True)
         .group_by('qseqid', maintain_order=True)
         .agg(pl.all().first())
     )
@@ -1167,12 +1469,15 @@ def main():
         out_pdb = os.path.join(outdir, f'classB:{qseqid}.pdb')
         if os.path.exists(out_pdb) and os.path.getsize(out_pdb) > 0:
             return qseqid, True, None, 0.0, True, db_type   # cached
-        ok, err, elapsed = build_classB_structure(
-            row, pdb_dir, out_pdb,
-            args.mm_iters, args.ccd_iters, args.ccd_tol, args.flank,
-            loop_closer=args.loop_closer,
-            max_indels=args.max_indels, max_indel_len=args.max_indel_len,
-        )
+        if ca_only:
+            ok, err, elapsed = build_classB_ca_only(row, pdb_dir, out_pdb)
+        else:
+            ok, err, elapsed = build_classB_structure(
+                row, pdb_dir, out_pdb,
+                args.mm_iters, args.ccd_iters, args.ccd_tol, args.flank,
+                loop_closer=args.loop_closer,
+                max_indels=args.max_indels, max_indel_len=args.max_indel_len,
+            )
         return qseqid, ok, err, elapsed, False, db_type
 
     from concurrent.futures import as_completed

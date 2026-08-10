@@ -25,7 +25,6 @@ use std::io::{BufWriter, Write};
 use std::time::Instant;
 
 const CHUNK: usize = 100_000;
-const DEFAULT_MAX_FREQ: usize = 500;
 
 fn open_reader(path: &str) -> ParquetRecordBatchReaderBuilder<std::fs::File> {
     let file = std::fs::File::open(path).expect("open parquet");

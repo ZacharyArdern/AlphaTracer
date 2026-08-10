@@ -37,6 +37,8 @@ import json
 import gzip
 import argparse
 import threading
+import asyncio
+import aiohttp
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -176,6 +178,8 @@ def parse_args():
                    help='Stop recycling if pLDDT after round 0 is below this — '
                         'sequence is likely disordered (default: 50)')
     # Class D options
+    p.add_argument('--no-write-candidates',  action='store_false', dest='write_candidates', default=True,
+                   help='Skip writing classC_candidates.pq (alignment + outcome for every Class C candidate)')
     p.add_argument('--no-classD',           action='store_true', default=False,
                    help='Skip Class D predictions')
     p.add_argument('--classD-limit',        type=int,   default=0,
@@ -185,8 +189,8 @@ def parse_args():
                         'Allows sequences up to ~512 aa to batch together.')
     p.add_argument('--no-compile',          action='store_true', default=False,
                    help='Disable mx.compile on MiniFormer (MLX backend only)')
-    p.add_argument('--max-seq-len',         type=int,   default=800,
-                   help='Skip MLX prediction for sequences longer than this (default: 800). '
+    p.add_argument('--max-seq-len',         type=int,   default=1000,
+                   help='Skip MLX prediction for sequences longer than this (default: 1000). '
                         'ESM2-3B attention maps scale as L², causing Metal OOM for long seqs. '
                         'Set to 0 to disable the check.')
     p.add_argument('--loop-closer',         default='ccd', choices=['ccd', 'promod3'],
@@ -218,38 +222,32 @@ def stage_download_pae(afdb_ids, pae_dir, threads):
     if not missing:
         return
 
-    def _fetch(afdb_id):
-        path = _pae_local_path(afdb_id, pae_dir)
-        try:
-            urllib.request.urlretrieve(_pae_url(afdb_id), path)
-            return f'ok:{afdb_id}'
-        except Exception as e:
-            if os.path.exists(path):
-                os.remove(path)
-            return f'fail:{afdb_id}:{e}'
+    async def _fetch_all(aids):
+        sem = asyncio.Semaphore(64)
+        connector = aiohttp.TCPConnector(limit=64)
+        async def _fetch_one(session, aid):
+            path = _pae_local_path(aid, pae_dir)
+            url  = _pae_url(aid)
+            async with sem:
+                for attempt in range(3):
+                    try:
+                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                            resp.raise_for_status()
+                            data = await resp.read()
+                        with open(path, 'wb') as f:
+                            f.write(data)
+                        return f'ok:{aid}'
+                    except Exception as e:
+                        if os.path.exists(path):
+                            os.remove(path)
+                        if attempt == 2:
+                            return f'fail:{aid}:{e}'
+                        await asyncio.sleep(0.5 * (attempt + 1))
+            return f'fail:{aid}:unreachable'
+        async with aiohttp.ClientSession(connector=connector) as session:
+            return await asyncio.gather(*[_fetch_one(session, aid) for aid in aids])
 
-    # ── first pass (threaded) ──────────────────────────────────────────────
-    with ThreadPoolExecutor(max_workers=min(32, len(missing))) as ex:
-        futures = {ex.submit(_fetch, aid): aid for aid in missing}
-        results = {}
-        for fut in as_completed(futures):
-            aid = futures[fut]
-            r = fut.result()
-            results[aid] = r
-            if r.startswith('fail'):
-                time.sleep(0.5)
-
-    # ── retry failures ─────────────────────────────────────────────────────
-    retry = [aid for aid, r in results.items() if r.startswith('fail')]
-    if retry:
-        print(f'  Retrying {len(retry)} failed PAE download(s)...')
-        for aid in retry:
-            r = _fetch(aid)
-            results[aid] = r
-            if r.startswith('fail'):
-                time.sleep(0.5)
-
-    all_results = list(results.values())
+    all_results = asyncio.run(_fetch_all(missing))
     n_ok = sum(1 for r in all_results if r.startswith('ok'))
     for r in all_results:
         if r.startswith('fail'):
@@ -631,6 +629,83 @@ def build_domain_pdb(domain_indices, ops, ref_poly, out_pdb,
 
     except Exception as e:
         return False, str(e), time.perf_counter() - t0
+
+
+def _split_broken_chains(pdb_path, ca_gap_threshold=5.5):
+    """Re-label chain IDs in a PDB so that each contiguous segment gets its own
+    chain letter.  A new chain starts wherever consecutive CA atoms are more than
+    *ca_gap_threshold* Å apart (default 5.5 Å; a normal peptide CA-CA is ~3.8 Å,
+    so a single missing residue already exceeds this).  Operates in-place."""
+    import string
+    chain_letters = list(string.ascii_uppercase)
+
+    with open(pdb_path) as fh:
+        lines = fh.readlines()
+
+    # Collect CA positions in order of appearance
+    ca_positions = []  # list of (line_index, x, y, z)
+    for i, line in enumerate(lines):
+        if line[:6] in ('ATOM  ', 'HETATM') and line[12:16].strip() == 'CA':
+            try:
+                x = float(line[30:38])
+                y = float(line[38:46])
+                z = float(line[46:54])
+                ca_positions.append((i, x, y, z))
+            except ValueError:
+                pass
+
+    if len(ca_positions) < 2:
+        return  # nothing to split
+
+    # Assign a segment index to each CA
+    seg = 0
+    ca_seg = [0]
+    for k in range(1, len(ca_positions)):
+        _, x0, y0, z0 = ca_positions[k - 1]
+        _, x1, y1, z1 = ca_positions[k]
+        d = ((x1-x0)**2 + (y1-y0)**2 + (z1-z0)**2) ** 0.5
+        if d > ca_gap_threshold:
+            seg += 1
+        ca_seg.append(seg)
+
+    if seg == 0:
+        return  # no breaks found, nothing to do
+
+    # Build mapping: line_index → new chain letter
+    line_to_chain = {}
+    for (line_idx, *_), s in zip(ca_positions, ca_seg):
+        line_to_chain[line_idx] = chain_letters[min(s, len(chain_letters) - 1)]
+
+    # For non-CA ATOM lines, inherit chain from the nearest preceding CA in same residue
+    # Strategy: scan sequentially, track current chain from last seen CA line
+    current_chain = chain_letters[0]
+    new_lines = []
+    ca_iter = iter(zip([li for li, *_ in ca_positions], ca_seg))
+    next_ca_line, next_ca_seg = next(ca_iter, (None, 0))
+
+    for i, line in enumerate(lines):
+        if line[:6] in ('ATOM  ', 'HETATM'):
+            if i == next_ca_line:
+                current_chain = chain_letters[min(next_ca_seg, len(chain_letters) - 1)]
+                next_ca_line, next_ca_seg = next(ca_iter, (None, 0))
+            line = line[:21] + current_chain + line[22:]
+        elif line.startswith('TER'):
+            line = line[:21] + current_chain + line[22:] if len(line) > 21 else line
+        new_lines.append(line)
+
+    # Insert TER records between chain segments
+    output = []
+    prev_chain = None
+    for line in new_lines:
+        if line[:6] in ('ATOM  ', 'HETATM'):
+            ch = line[21]
+            if prev_chain is not None and ch != prev_chain:
+                output.append(f'TER\n')
+            prev_chain = ch
+        output.append(line)
+
+    with open(pdb_path, 'w') as fh:
+        fh.writelines(output)
 
 
 # ── MLX model loading and prediction ─────────────────────────────────────────
@@ -1350,6 +1425,7 @@ def main():
 
     os.makedirs(outdir_C, exist_ok=True)
     os.makedirs(pae_dir,  exist_ok=True)
+    os.makedirs(pdb_dir,  exist_ok=True)
 
     print('=' * 60)
     print('AlphaTracer 1.0  —  Class C + D Pipeline')
@@ -1398,11 +1474,14 @@ def main():
 
     # ── [C-1] Alignment ───────────────────────────────────────────────────────
     exclude_ids = classA_ids | classB_ids
+    _sort_col = 'jaccard' if 'jaccard' in hits_df.columns else 'approx_pident'
+    candidates = hits_df
+    if 'approx_pident' in hits_df.columns:
+        candidates = candidates.filter(pl.col('approx_pident') >= args.min_pctsim)
     candidates = (
-        hits_df
-        .filter(pl.col('approx_pident') >= args.min_pctsim)
+        candidates
         .filter(~pl.col('qseqid').is_in(exclude_ids))
-        .sort('approx_pident', descending=True)
+        .sort(_sort_col, descending=True)
         .group_by('qseqid', maintain_order=True)
         .agg(pl.all().first())
     )
@@ -1654,6 +1733,17 @@ def main():
     if n_no_pdb:
         print(f'  No PDB (ESM):       {n_no_pdb}')
 
+    # Write candidate alignment table (all Class C candidates + outcome).
+    if args.write_candidates:
+        _status_map = {(result_row or {}).get('qseqid', ''): status
+                       for result_row, status in qual_results}
+        cand_pq = os.path.join(indir, 'classC_candidates.pq')
+        cand_df = merged.with_columns(
+            pl.col('qseqid').replace(_status_map, default='skip').alias('classC_status')
+        )
+        cand_df.write_parquet(cand_pq)
+        print(f'  Candidates written: {cand_pq}')
+
     classC_ids = {r['qseqid'] for r in classC_rows}
 
     # ── [C-4] Build Class C structures ────────────────────────────────────────
@@ -1716,6 +1806,8 @@ def main():
                 args.mm_iters, args.ccd_iters, args.ccd_tol, args.flank,
                 anchor_k=args.anchor_k, loop_closer=args.loop_closer,
             )
+            if ok:
+                _split_broken_chains(out_pdb)
         return qseqid, ok, err, elapsed, len(best_domain), False
 
     # fill_missing uses MLX (not thread-safe) → must run in main thread (plain loop);

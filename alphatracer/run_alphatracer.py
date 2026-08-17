@@ -543,7 +543,7 @@ def main() -> None:
             if bar:
                 bar.phase('Searching for Class A sequences (DIAMOND)...')
             cmd_a = [
-                py_main, _script('AT_classA.py'),
+                py_main, _script('pipeline/AT_classA.py'),
                 '-i', args.input,
                 '-d', args.database,
                 '-t', str(args.threads),
@@ -556,7 +556,7 @@ def main() -> None:
                 if bar:
                     bar.phase('Building Class B structures...')
                 cmd_b = [
-                    py_main, _script('AT_classB.py'),
+                    py_main, _script('pipeline/AT_classB.py'),
                     '-i', proc_dir,
                     '-t', str(args.threads),
                     '--max-indels',         str(args.max_indels),
@@ -582,7 +582,7 @@ def main() -> None:
             if bar:
                 bar.phase('Searching for Class A sequences (kmer)...')
             cmd_a_classify = [
-                py_main, _script('AT_classA_kmer.py'),
+                py_main, _script('pipeline/AT_classA_kmer.py'),
                 '-i', args.input,
                 '-t', str(args.threads),
                 '--top-k',         str(args.top_k),
@@ -596,7 +596,7 @@ def main() -> None:
 
             # Phase 2 — A download+build concurrently with full Class B
             cmd_a_dl = [
-                py_main, _script('AT_classA_kmer.py'),
+                py_main, _script('pipeline/AT_classA_kmer.py'),
                 '-i', args.input,
                 '-t', str(args.threads),
                 '--top-k',              str(args.top_k),
@@ -609,7 +609,7 @@ def main() -> None:
 
             if not args.skip_classB:
                 cmd_b = [
-                    py_main, _script('AT_classB.py'),
+                    py_main, _script('pipeline/AT_classB.py'),
                     '-i', proc_dir,
                     '-t', str(args.threads),
                     '--max-indels',         str(args.max_indels),
@@ -672,7 +672,7 @@ def main() -> None:
             if bar:
                 bar.phase('Building Class B structures...')
             cmd_b = [
-                py_main, _script('AT_classB.py'),
+                py_main, _script('pipeline/AT_classB.py'),
                 '-i', proc_dir,
                 '-t', str(args.threads),
                 '--max-indels',         str(args.max_indels),
@@ -706,7 +706,7 @@ def main() -> None:
         if bar:
             bar.phase('Building Class C and D structures...')
         cmd_cd = [
-            py_cd, _script('AT_classC_and_D.py'),
+            py_cd, _script('pipeline/AT_classC_and_D.py'),
             '-i', proc_dir,
             '-t', str(args.threads),
             '--min-pctsim',             str(c_min_pctsim),

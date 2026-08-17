@@ -2,6 +2,8 @@
 
 AlphaTracer is a homology-guided protein structure prediction pipeline. It classifies query sequences into four tiers based on their relationship to structures in the AlphaFold Database (AFDB) and ESM Atlas, applying the most accurate method available for each tier. Sequences without homologs with adequate structures will have structures inferred with the MiniFold model (based on ESM-2 and ESMfold).
 
+The name reflects the core approach: AlphaTracer *traces* a path through existing AlphaFold structures to build models for new sequences, falling back to de novo prediction only when no suitable template exists.
+
 ## How it works
 
 Each query sequence is processed through four classes in order. Once a sequence is handled by a class, it does not proceed to subsequent classes.

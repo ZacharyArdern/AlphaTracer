@@ -6,8 +6,12 @@ use rustc_hash::FxHashMap;
 use std::collections::BinaryHeap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+pub mod utils;
+
 #[cfg(feature = "extension-module")]
 use pyo3::prelude::*;
+#[cfg(feature = "extension-module")]
+mod python;
 
 pub const CHUNK: usize = 100_000;
 
@@ -276,54 +280,8 @@ pub fn read_fasta(path: &str) -> (Vec<String>, Vec<Vec<u8>>) {
     (ids, seqs)
 }
 
-// ── PyO3 bindings ─────────────────────────────────────────────────────────────
-
-#[cfg(feature = "extension-module")]
-#[pyfunction]
-#[pyo3(signature = (sidx_path, fasta_path, top_k=5, min_shared=2, n_hash_search=0))]
-fn search_fasta(
-    py: Python<'_>,
-    sidx_path: String,
-    fasta_path: String,
-    top_k: usize,
-    min_shared: u32,
-    n_hash_search: usize,
-) -> PyResult<Vec<(String, u32, u32, f64)>> {
-    use rayon::prelude::*;
-    use std::sync::Arc;
-
-    let out = py.allow_threads(move || {
-        let idx = load_index(&sidx_path);
-        let (dayhoff_arr, n_letters) = build_alphabet(&idx.scheme);
-        let base     = n_letters as u32;
-        let k        = idx.k;
-        let n_hash   = idx.n_hash;
-        let n_hs     = if n_hash_search == 0 { n_hash } else { n_hash_search };
-        let dayhoff  = Arc::new(dayhoff_arr);
-
-        let (query_ids, query_seqs) = read_fasta(&fasta_path);
-        let dh = Arc::clone(&dayhoff);
-        let query_sketches: Vec<Vec<u32>> = query_seqs.par_iter()
-            .map(|s| sketch(s, &dh, k, n_hash, base))
-            .collect();
-
-        let progress = AtomicUsize::new(0);
-        let results  = run_search(&idx, &query_sketches, min_shared, top_k, n_hs, &progress);
-
-        let mut out = Vec::new();
-        for (qi, hits) in results.iter().enumerate() {
-            for &(shared, seq_idx) in hits {
-                out.push((query_ids[qi].clone(), seq_idx, shared, shared as f64 / n_hs as f64));
-            }
-        }
-        out
-    });
-    Ok(out)
-}
-
 #[cfg(feature = "extension-module")]
 #[pymodule]
-fn recoded_sketch(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(search_fasta, m)?)?;
-    Ok(())
+fn alphatracer_sketch(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    python::register(m)
 }

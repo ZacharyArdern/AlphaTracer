@@ -3,11 +3,11 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "recoded-sketch"
+name = "alphatracer-sketch"
 version = "0.1.0"
 description = "Fast reduced-alphabet protein sketch search"
 requires-python = ">=3.8"
 
 [tool.maturin]
-module-name = "recoded_sketch"
+module-name = "alphatracer_sketch"
 features = ["extension-module"]

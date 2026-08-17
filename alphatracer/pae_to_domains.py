@@ -116,13 +116,13 @@ def parse_pae_batch_rust(paths: list, step: int) -> dict:
 
     _bin_dir = os.path.join(
         os.environ.get('AT_CACHE_DIR', os.path.expanduser('~/.cache/alphatracer')),
-        'sketch_rs', 'release',
+        'dayhoff_sketch', 'release',
     )
     binary = os.path.join(_bin_dir, 'parse-pae')
     if not os.path.exists(binary):
         raise FileNotFoundError(
             f'parse-pae binary not found at {binary}. '
-            'Run: cargo build --release inside alphatracer/sketch_rs/'
+            'Run: cargo build --release inside alphatracer/dayhoff_sketch/'
         )
 
     r = subprocess.run([binary, str(step)] + list(paths), capture_output=True)

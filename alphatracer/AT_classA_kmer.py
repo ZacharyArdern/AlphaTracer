@@ -19,7 +19,7 @@ Usage:
 """
 
 import asyncio
-import gzip, os, re, subprocess, sys, time, argparse, pickle, threading
+import os, re, subprocess, sys, time, argparse, pickle, threading
 from pathlib import Path
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,9 +30,11 @@ import polars as pl
 import parasail
 import gemmi
 import duckdb
-import pyarrow as pa
-import pyarrow.parquet as pq
-from Bio import SeqIO
+from alphatracer.utils.structures_fetch import (
+    AFDB_VERSION, get_afdb_id, afdb_local_pdb, is_valid_pdb,
+    esm_local_pdb, _ESM_DIR, fetch_afdb_pdbs, fetch_esm_structures,
+    parse_fasta,
+)
 
 try:
     from tqdm import tqdm
@@ -58,10 +60,7 @@ _HAS_DB_TYPE       = False  # True for merged AFDB+ESMAtlas DBs with db_type col
 _HAS_SEQ_IDX       = False  # True when parquet has seq_idx integer column (enables DuckDB min/max pruning)
 _IS_STANDALONE_ESM = False  # True for standalone ESMAtlas DBs (header+sequence only, no db_type col)
 
-# Directory containing esm_query.py — override with AT_ESM_DIR env var.
-_ESM_DIR = os.environ.get('AT_ESM_DIR',
-               os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            '..', '..', '..', '..', 'Data', 'ESMAtlas'))
+# _ESM_DIR imported from alphatracer.utils.structures_fetch
 
 
 def _configure_db(sketch_db: str | None = None) -> None:
@@ -83,8 +82,7 @@ def _configure_db(sketch_db: str | None = None) -> None:
     if not os.path.isfile(REPS_PQ):
         sys.exit(f"[FATAL] sequence database not found: {REPS_PQ}\n"
                  f"        Set AT_AFDB_DIR or pass --sketch-db.")
-    schema = pq.read_schema(REPS_PQ)
-    names  = schema.names
+    names = pl.read_parquet(REPS_PQ, n_rows=0).columns
     if "rep_AFDB_ID" in names:
         _ID_COL = "rep_AFDB_ID"
     elif "AFDB_ID" in names:
@@ -103,21 +101,21 @@ def _configure_db(sketch_db: str | None = None) -> None:
     if _IS_STANDALONE_ESM:
         print("[DB] Standalone ESMAtlas DB detected — will tag hits as db_type='esm_atlas'", flush=True)
 
-# sketch-rs source is bundled in the package; binaries are compiled into a user cache dir.
-_SKETCH_RS_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sketch_rs')
+# dayhoff_sketch source is bundled in the package; binaries are compiled into a user cache dir.
+_SKETCH_RS_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dayhoff_sketch')
 _SKETCH_RS_CARGO_TARGET = os.path.join(
     os.environ.get('AT_CACHE_DIR', os.path.expanduser("~/.cache/alphatracer")),
-    'sketch_rs',
+    'dayhoff_sketch',
 )
 _SKETCH_RS_BIN = os.path.join(_SKETCH_RS_CARGO_TARGET, 'release')
+
+# AFDB_VERSION, get_afdb_id, afdb_local_pdb, is_valid_pdb, esm_local_pdb
+# imported from alphatracer.utils.structures_fetch
 
 K            = 9
 MAX_FREQ     = 0.001
 MIN_SHARED   = 2
 N_HASH_SEARCH = 0  # 0 = use index n_hash; set from --n-hash-search in main()
-
-AFDB_VERSION = 6
-
 
 # ── Constants (same as AT_classA.py) ──────────────────────────────────────────
 
@@ -139,8 +137,8 @@ def parse_args():
                    help='Input FASTA of query protein sequences')
     p.add_argument('-t', '--threads', type=int, default=4,
                    help='CPU threads for parallel downloads (default: 4)')
-    p.add_argument('--top-k', type=int, default=5,
-                   help='Hits per query from kmer search (default: 5)')
+    p.add_argument('--top-k', type=int, default=100,
+                   help='Hits per query from kmer search (default: 100)')
     p.add_argument('--window-size', type=int, default=40,
                    help='Sliding window size for identity check (default: 40)')
     p.add_argument('--pctsim', type=float, default=80.0,
@@ -241,73 +239,14 @@ def is_classA(qseq_alg, sseq_alg, alg_comp, window, threshold):
     return all_windows_pass(comp_core, window, threshold)
 
 
-# ── AFDB helpers (identical to AT_classA.py) ──────────────────────────────────
-
-def get_afdb_id(sseqid):
-    """Extract bare AlphaFold accession from sseqid.
-
-    >>> get_afdb_id('AF-A0A000-F1')
-    'AF-A0A000-F1'
-    >>> get_afdb_id('AF-A0A000-F1-model_v4')
-    'AF-A0A000-F1'
-    >>> get_afdb_id('unknown') is None
-    True
-    """
-    if ':' in sseqid:
-        acc = sseqid.split(':')[1]
-    elif sseqid.startswith('AF-'):
-        acc = sseqid
-    else:
-        return None
-    return re.sub(r'-model_v\d+$', '', acc)
-
-
-def afdb_local_pdb(afdb_id, pdb_dir):
-    return os.path.join(pdb_dir, f'{afdb_id}-model_v{AFDB_VERSION}.pdb')
-
-
-def _is_valid_pdb(path):
-    try:
-        with open(path, 'rb') as f:
-            header = f.read(6).decode('ascii', errors='ignore')
-        return header.strip()[:6] in ('HEADER', 'REMARK', 'ATOM  ', 'MODEL ')
-    except Exception:
-        return False
-
-
-async def _fetch_all_aiohttp(afdb_ids, pdb_dir):
-    """Download a batch of AFDB PDB files with aiohttp. Returns {aid: status_str}."""
-    sem = asyncio.Semaphore(64)
-    connector = aiohttp.TCPConnector(limit=64)
-
-    async def _fetch_one(session, aid):
-        path = afdb_local_pdb(aid, pdb_dir)
-        filename = os.path.basename(path)
-        if os.path.exists(path) and _is_valid_pdb(path):
-            return aid, f'exists:{filename}'
-        url = f'https://alphafold.ebi.ac.uk/files/{filename}'
-        async with sem:
-            try:
-                async with session.get(url) as resp:
-                    data = await resp.read()
-                with open(path, 'wb') as f:
-                    f.write(data)
-                if _is_valid_pdb(path):
-                    return aid, f'downloaded:{filename}'
-                os.remove(path)
-                return aid, f'failed:{aid}:server returned non-PDB content'
-            except Exception as e:
-                if os.path.exists(path):
-                    os.remove(path)
-                return aid, f'failed:{aid}:{e}'
-
-    async with aiohttp.ClientSession(connector=connector) as session:
-        return dict(await asyncio.gather(*[_fetch_one(session, aid) for aid in afdb_ids]))
+# get_afdb_id, afdb_local_pdb, is_valid_pdb, _ESM_DIR, esm_local_pdb,
+# fetch_afdb_pdbs, fetch_esm_structures imported from alphatracer.utils.structures_fetch
 
 
 def _fetch_pdb(afdb_id, pdb_dir):
     """Synchronous single-file fetch (on-demand fallback)."""
-    return asyncio.run(_fetch_all_aiohttp([afdb_id], pdb_dir))[afdb_id]
+    from alphatracer.utils.structures_fetch import _fetch_afdb_pdbs_async
+    return asyncio.run(_fetch_afdb_pdbs_async([afdb_id], pdb_dir))[afdb_id]
 
 
 # ── Stage 1: filter FASTA ──────────────────────────────────────────────────────
@@ -318,9 +257,7 @@ def stage_filter(input_path, output_path):
     seq_dict = {}
     n_in = 0
     print("  Parsing input FASTA...", flush=True)
-    open_fn = gzip.open if input_path.endswith('.gz') else open
-    with open_fn(input_path, 'rt') as _fh:
-        records = list(SeqIO.parse(_fh, 'fasta'))
+    records = list(parse_fasta(input_path))
     for record in records:
         n_in += 1
         seq = str(record.seq)
@@ -359,7 +296,7 @@ def _ensure_binaries():
     search     = os.path.join(_SKETCH_RS_BIN, "search")
     if os.path.exists(index_seqs) and os.path.exists(search):
         return index_seqs, search
-    print("  sketch-rs binaries not found — building with cargo (one-time, ~30s)...", flush=True)
+    print("  dayhoff_sketch binaries not found — building with cargo (one-time, ~30s)...", flush=True)
     os.makedirs(_SKETCH_RS_BIN, exist_ok=True)
     # CARGO_TARGET_DIR redirects build output to the user cache dir,
     # keeping the bundled source (which may be in read-only site-packages) untouched.
@@ -370,7 +307,7 @@ def _ensure_binaries():
         print(r.stderr)
         sys.exit('ERROR: cargo build failed. Is the Rust toolchain installed? '
                  'Install from https://rustup.rs')
-    print("  sketch-rs binaries built and cached.", flush=True)
+    print("  dayhoff_sketch binaries built and cached.", flush=True)
     return index_seqs, search
 
 
@@ -382,7 +319,7 @@ def _build_sidx(index_seqs_bin):
     temp parquet is streamed first, then cleaned up after indexing.
     """
     global _ID_COL
-    n = pq.read_metadata(REPS_PQ).num_rows
+    n = duckdb.connect().execute(f"SELECT count(*) FROM read_parquet('{REPS_PQ}')").fetchone()[0]
     print(f"  Building V2 inverted index from {n:,} sequences (runs once, cached)...", flush=True)
     t0 = time.time()
 
@@ -391,25 +328,15 @@ def _build_sidx(index_seqs_bin):
         src_pq = REPS_PQ
         tmp_pq = None
     else:
-        # Stream a renamed copy so index-seqs sees the expected column name.
+        # Write a renamed copy so index-seqs sees the expected column name.
         tmp_pq = REPS_PQ.rsplit('.', 1)[0] + "_idrenamed_tmp.pq"
-        print(f"  Streaming renamed parquet ('{id_col}' → 'AFDB_ID') → {tmp_pq}", flush=True)
-        reader = pq.ParquetFile(REPS_PQ)
-        writer = None
-        done   = 0
-        for batch in reader.iter_batches(batch_size=100_000):
-            cols  = batch.schema.names
-            renamed = batch.rename_columns(
-                ["AFDB_ID" if c == id_col else c for c in cols]
-            )
-            if writer is None:
-                writer = pq.ParquetWriter(tmp_pq, renamed.schema, compression="zstd")
-            writer.write_batch(renamed)
-            done += len(batch)
-            print(f"    {done:>12}/{n}\r", end="", flush=True)
-        if writer:
-            writer.close()
-        print(flush=True)
+        print(f"  Writing renamed parquet ('{id_col}' → 'AFDB_ID') → {tmp_pq}", flush=True)
+        other_cols = [c for c in pl.read_parquet(REPS_PQ, n_rows=0).columns if c != id_col]
+        col_sql = ", ".join([f'"{id_col}" AS "AFDB_ID"'] + [f'"{c}"' for c in other_cols])
+        duckdb.connect().execute(
+            f"COPY (SELECT {col_sql} FROM read_parquet('{REPS_PQ}'))"
+            f" TO '{tmp_pq}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+        )
         src_pq = tmp_pq
 
     try:
@@ -425,39 +352,23 @@ def _build_sidx(index_seqs_bin):
 
 
 def _fetch_by_row_indices(pq_path: str, row_indices: set, cols: list) -> dict:
-    """Fetch parquet rows by row index using row-group targeting (fast path for v3 sidx).
+    """Fetch parquet rows by row index via polars scan with row_index filter.
 
     Returns {row_idx: {col: value}} for each requested index.
-    Only the row groups that contain requested rows are read, avoiding a full scan.
+    Used only for parquets without a seq_idx column (e.g. ESM standalone).
     """
-    import bisect
-    from collections import defaultdict
-    f   = pq.ParquetFile(pq_path)
-    meta = f.metadata
-
-    # Build cumulative row-group start positions.
-    rg_starts = []
-    rg_sizes  = []
-    cumulative = 0
-    for i in range(meta.num_row_groups):
-        rg_starts.append(cumulative)
-        rg_sizes.append(meta.row_group(i).num_rows)
-        cumulative += rg_sizes[-1]
-
-    # Assign each requested index to its row group (binary search).
-    rg_to_local = defaultdict(list)
-    for idx in row_indices:
-        rg_i = bisect.bisect_right(rg_starts, idx) - 1
-        if 0 <= rg_i < len(rg_starts):
-            rg_to_local[rg_i].append((idx, idx - rg_starts[rg_i]))
-
-    # Read only the needed row groups.
-    results = {}
-    for rg_i, rows in rg_to_local.items():
-        table = f.read_row_group(rg_i, columns=cols)
-        for abs_idx, rel_idx in rows:
-            results[abs_idx] = {col: table.column(col)[rel_idx].as_py() for col in cols}
-    return results
+    idx_list = sorted(row_indices)
+    df = (
+        pl.scan_parquet(pq_path)
+        .with_row_index("_ri")
+        .filter(pl.col("_ri").is_in(idx_list))
+        .select(["_ri"] + cols)
+        .collect()
+    )
+    return {
+        row[0]: {col: row[i + 1] for i, col in enumerate(cols)}
+        for row in df.iter_rows()
+    }
 
 
 def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
@@ -465,7 +376,7 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
     Run Rust kmer sketch search against the AFDB rep index.
 
     Returns a polars DataFrame with columns matching what stage_align_and_classify expects:
-      jaccard, sseqid, qseqid, evalue, slen, qlen,
+      containment_value, sseqid, qseqid, evalue, slen, qlen,
       full_qseq, full_sseq, function, family, group_size, n_reps
     """
     index_seqs_bin, search_bin = _ensure_binaries()
@@ -477,15 +388,25 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
 
     print(f"  Running Rust search (top_k={top_k})...", flush=True)
     t0 = time.time()
-    r = subprocess.run(
+    proc = subprocess.Popen(
         [search_bin, SIDX_CACHE, filtered_fasta,
-         str(top_k), str(MIN_SHARED), "150", str(K), str(N_HASH_SEARCH)],
-        capture_output=True, text=True
+         str(top_k), str(MIN_SHARED), str(K), str(N_HASH_SEARCH)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
     )
-    if r.returncode != 0:
-        print(r.stderr); sys.exit(1)
-    sys.stderr.write(r.stderr)
-    lines = r.stdout.splitlines()
+    # Stream stderr live (progress bar) while collecting stdout
+    stdout_lines = []
+    def _drain_stderr():
+        for line in proc.stderr:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
+    stdout_lines = proc.stdout.read().splitlines()
+    proc.wait()
+    stderr_thread.join()
+    if proc.returncode != 0:
+        sys.exit(1)
+    lines = stdout_lines
     header   = lines[0] if lines else ""
     raw_hits = lines[1:] if lines else []
     is_row_idx = "row_idx" in header  # v3 sidx: targets are parquet row indices
@@ -498,7 +419,7 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
 
     if not raw_hits:
         return pl.DataFrame(schema={
-            'jaccard': pl.Float64, 'sseqid': pl.String, 'qseqid': pl.String,
+            'containment_value': pl.Float64, 'sseqid': pl.String, 'qseqid': pl.String,
             'evalue': pl.Float64, 'slen': pl.Int32, 'qlen': pl.Int32,
             'full_qseq': pl.String, 'full_sseq': pl.String,
             'function': pl.String, 'family': pl.String,
@@ -512,8 +433,8 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
         parts = line.split("\t")
         if len(parts) < 4:
             continue
-        query, target, shared, jaccard = parts[0], parts[1], int(parts[2]), float(parts[3])
-        parsed.append((query, target, shared, jaccard))
+        query, target, shared, containment_value = parts[0], parts[1], int(parts[2]), float(parts[3])
+        parsed.append((query, target, shared, containment_value))
         targets.add(target)
 
     # ── Progressive annotation cache ──────────────────────────────────────────
@@ -596,30 +517,39 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
         id_col_local = _ID_COL or "rep_AFDB_ID"
         stale = [int(t) for t in targets if t in ann_pkl and not ann_pkl[t][0]]
         if stale:
-            stale_rows = _fetch_by_row_indices(REPS_PQ, set(stale), [id_col_local])
-            for row_idx_int, data in stale_rows.items():
-                existing = ann_pkl[str(row_idx_int)]
-                ann_pkl[str(row_idx_int)] = (data.get(id_col_local, ""),) + existing[1:]
+            if _HAS_SEQ_IDX:
+                stale_db = duckdb.connect().execute(
+                    f"SELECT seq_idx, {id_col_local} FROM read_parquet('{REPS_PQ}')"
+                    f" WHERE seq_idx IN (SELECT unnest(?))", [stale]
+                ).fetchall()
+                for row_idx_int, afdb_id_val in stale_db:
+                    existing = ann_pkl[str(row_idx_int)]
+                    ann_pkl[str(row_idx_int)] = (afdb_id_val or "",) + existing[1:]
+            else:
+                stale_rows = _fetch_by_row_indices(REPS_PQ, set(stale), [id_col_local])
+                for row_idx_int, data in stale_rows.items():
+                    existing = ann_pkl[str(row_idx_int)]
+                    ann_pkl[str(row_idx_int)] = (data.get(id_col_local, ""),) + existing[1:]
             _save_ann_cache(ann_pkl)
         _row_idx_to_afdb = {t: ann_pkl[t][0] for t in targets if t in ann_pkl and ann_pkl[t][0]}
 
     # Save raw search output for reference
     with open(outfile, 'w') as f:
-        f.write("query\ttarget\tshared\tjaccard\tfunction\tfamily\tsequence\n")
-        for query, target, shared, jaccard in parsed:
+        f.write("query\ttarget\tshared\tcontainment_value\tfunction\tfamily\tsequence\n")
+        for query, target, shared, containment_value in parsed:
             func, fam, gs, nr = ann_map.get(target, ("", "", 0, 0))
             seq = seq_map.get(target, "")
-            f.write(f"{query}\t{target}\t{shared}\t{jaccard:.4f}\t{func}\t{fam}\t{seq}\n")
+            f.write(f"{query}\t{target}\t{shared}\t{containment_value:.4f}\t{func}\t{fam}\t{seq}\n")
 
     rows = []
-    for query, target, shared, jaccard in parsed:
+    for query, target, shared, containment_value in parsed:
         func, fam, gs, nr = ann_map.get(target, ("", "", 0, 0))
         full_qseq = query_seq_dict.get(query, "")
         full_sseq = seq_map.get(target, "")
         if not full_qseq or not full_sseq:
             continue
         row = {
-            'jaccard':       jaccard,
+            'containment_value':       containment_value,
             'sseqid':        _row_idx_to_afdb.get(target, target),
             'qseqid':        query,
             'evalue':        0.0,
@@ -662,125 +592,54 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
 # ── Stage 3: align and classify ────────────────────────────────────────────────
 
 def stage_align_and_classify(hits_df, window, threshold, threads=4):
+    """Align and classify with early exit: candidates are processed in descending
+    containment_value order per query; alignment stops as soon as a Class A hit is found.
+    Parallelises across queries (not pairs), so threads are fully utilised."""
     total = len(hits_df)
-    print(f"  Aligning {total} query-hit pairs (threads={threads})...", flush=True)
-    rows_list = list(hits_df.iter_rows(named=True))
+    n_queries = hits_df['qseqid'].n_unique()
+    print(f"  Aligning {total} candidates for {n_queries} queries "
+          f"(early-exit, threads={threads})...", flush=True)
 
-    def _aln(row):
-        return align_nw(row['qseqid'], row['sseqid'], row['full_qseq'], row['full_sseq'])
+    # Group rows by query, already sorted descending by containment_value from the search binary.
+    groups: dict[str, list] = {}
+    for row in hits_df.sort('containment_value', descending=True).iter_rows(named=True):
+        groups.setdefault(row['qseqid'], []).append(row)
 
-    aln_rows = []
+    def _align_query(query_rows: list) -> dict | None:
+        """Align candidates for one query in ranked order; return first Class A hit."""
+        for row in query_rows:
+            result = align_nw(row['qseqid'], row['sseqid'],
+                              row['full_qseq'], row['full_sseq'])
+            if result is None:
+                continue
+            _, _, qseq_alg, sseq_alg, alg_comp = result
+            qseq_alg = fix_hanging_group_letters(qseq_alg)
+            sseq_alg = fix_hanging_group_letters(sseq_alg)
+            alg_comp = fix_hanging_group_letters(alg_comp)
+            if is_classA(qseq_alg, sseq_alg, alg_comp, window, threshold):
+                return {**row, 'qseq_alg': qseq_alg,
+                        'sseq_alg': sseq_alg, 'alg_comp': alg_comp}
+        return None
+
+    classA_rows = []
     done = 0
     with ThreadPoolExecutor(max_workers=threads) as ex:
-        for result in ex.map(_aln, rows_list):
+        for result in ex.map(_align_query, groups.values()):
             done += 1
             if result:
-                aln_rows.append(result)
-            if done % 200 == 0 or done == total:
-                print(f'  Aligning {done}/{total}...', end='\r', flush=True)
+                classA_rows.append(result)
+            if done % 100 == 0 or done == n_queries:
+                print(f'  Processed {done}/{n_queries} queries, '
+                      f'{len(classA_rows)} Class A so far...', end='\r', flush=True)
     print()
 
-    if not aln_rows:
+    if not classA_rows:
         return pl.DataFrame(schema={
-            'qseqid': pl.String, 'sseqid': pl.String,
+            **{c: hits_df.schema[c] for c in hits_df.columns},
             'qseq_alg': pl.String, 'sseq_alg': pl.String, 'alg_comp': pl.String,
         })
 
-    aln_df = pl.DataFrame(
-        aln_rows,
-        schema=['qseqid', 'sseqid', 'qseq_alg', 'sseq_alg', 'alg_comp'],
-        orient='row',
-    )
-    for col in ['qseq_alg', 'sseq_alg', 'alg_comp']:
-        aln_df = aln_df.with_columns(
-            pl.col(col).map_elements(fix_hanging_group_letters, return_dtype=pl.String)
-        )
-
-    merged = hits_df.join(aln_df, on=['qseqid', 'sseqid'], how='inner')
-
-    classA_df = merged.filter(
-        pl.struct(['qseq_alg', 'sseq_alg', 'alg_comp']).map_elements(
-            lambda r: is_classA(r['qseq_alg'], r['sseq_alg'], r['alg_comp'],
-                                window, threshold),
-            return_dtype=pl.Boolean,
-        )
-    )
-    return classA_df
-
-
-# ── ESM Atlas structure fetcher ────────────────────────────────────────────────
-
-def _esm_local_pdb(protein_hash, pdb_dir):
-    return os.path.join(pdb_dir, f'esm_{protein_hash}.pdb')
-
-
-def _fetch_esm_pdbs(esm_df, pdb_dir, n_workers=8):
-    """Batch-fetch ESM Atlas structure blobs from Lance and write as PDB files."""
-    esm_dir = os.path.abspath(_ESM_DIR)
-    if esm_dir not in sys.path:
-        sys.path.insert(0, esm_dir)
-    try:
-        import esm_query as _esm
-    except ImportError:
-        print(f'  [WARN] Cannot import esm_query from {esm_dir} — ESM Atlas hits will be skipped')
-        return
-
-    # Collect protein_hashes that need fetching; resolve fragment coords via lookup_hashes if missing.
-    need_lookup, hits = [], []
-    for row in esm_df.unique(subset=['protein_hash']).iter_rows(named=True):
-        ph  = row['protein_hash']
-        fid = row.get('fragment_id', -1)
-        fr  = row.get('frag_row', -1)
-        if not ph:
-            continue
-        if os.path.exists(_esm_local_pdb(ph, pdb_dir)):
-            continue
-        if fid is not None and fid >= 0 and fr is not None and fr >= 0:
-            hits.append({'fragment_id': fid, 'frag_row': fr, 'protein_hash': ph})
-        else:
-            need_lookup.append(ph)
-
-    if need_lookup:
-        print(f'  Resolving {len(need_lookup)} ESM protein_hash(es) via local index...', flush=True)
-        try:
-            idx = _esm.lookup_hashes(need_lookup)
-            for ph, fid, fr in zip(idx['protein_hash'].to_pylist(),
-                                    idx['fragment_id'].to_pylist(),
-                                    idx['frag_row'].to_pylist()):
-                if fid >= 0 and fr >= 0:
-                    hits.append({'fragment_id': int(fid), 'frag_row': int(fr), 'protein_hash': ph})
-                else:
-                    print(f'  [WARN] No index entry for ESM protein_hash {ph} — skipping', flush=True)
-        except Exception as e:
-            print(f'  [WARN] ESM lookup_hashes failed: {e}', flush=True)
-
-    if not hits:
-        return
-
-    print(f'  Fetching {len(hits)} ESM Atlas structure(s) from S3...', flush=True)
-    t0 = time.time()
-    try:
-        results = _esm.query_from_hits(hits, columns=['protein_hash', 'structure_blob'],
-                                        n_workers=n_workers)
-    except Exception as e:
-        print(f'  [WARN] ESM Atlas fetch failed: {type(e).__name__}: {e}')
-        return
-
-    n_written = 0
-    for batch in results.to_batches():
-        hashes = batch['protein_hash'].to_pylist()
-        blobs  = batch['structure_blob'].to_pylist()
-        for ph, blob in zip(hashes, blobs):
-            pdb_path = _esm_local_pdb(ph, pdb_dir)
-            try:
-                with open(pdb_path, 'w') as f:
-                    f.write(_esm.blob_to_pdb(blob))
-                n_written += 1
-            except Exception as e:
-                print(f'  [WARN] ESM Atlas decode failed for {ph}: {e}')
-
-    print(f'  Fetched {n_written}/{len(hits)} ESM Atlas structure(s) in {time.time()-t0:.1f}s',
-          flush=True)
+    return pl.DataFrame(classA_rows)
 
 
 # ── Stage 4: download PDBs ─────────────────────────────────────────────────────
@@ -788,7 +647,7 @@ def _fetch_esm_pdbs(esm_df, pdb_dir, n_workers=8):
 def stage_download(classA_df, pdb_dir, threads):
     top_sseqids = (
         classA_df
-        .sort('jaccard', descending=True)
+        .sort('containment_value', descending=True)
         .group_by('qseqid', maintain_order=True)
         .agg(pl.col('sseqid').first())
         ['sseqid'].to_list()
@@ -796,26 +655,7 @@ def stage_download(classA_df, pdb_dir, threads):
     afdb_ids = {get_afdb_id(sid) for sid in top_sseqids if get_afdb_id(sid)}
     print(f'  {len(afdb_ids)} unique AlphaFold accession(s) to download (v{AFDB_VERSION})',
           flush=True)
-
-    afdb_list = list(afdb_ids)
-
-    # ── first pass ────────────────────────────────────────────────────────
-    results = asyncio.run(_fetch_all_aiohttp(afdb_list, pdb_dir))
-
-    # ── retry failures ─────────────────────────────────────────────────────
-    retry = [aid for aid, r in results.items() if r.startswith('fail')]
-    if retry:
-        print(f'  Retrying {len(retry)} failed download(s)...')
-        results.update(asyncio.run(_fetch_all_aiohttp(retry, pdb_dir)))
-
-    all_results = list(results.values())
-    summary = Counter(r.split(':')[0] for r in all_results)
-    for r in all_results:
-        if r.startswith('fail'):
-            print(f'  FAILED: {r}')
-    print(f"  Downloaded: {summary['downloaded']}  "
-          f"Already present: {summary['exists']}  "
-          f"Failed: {summary.get('failed', 0) + summary.get('fail', 0)}")
+    fetch_afdb_pdbs(afdb_ids, pdb_dir)
 
 
 # ── Stage 4+5: pipelined download and build ────────────────────────────────────
@@ -829,18 +669,19 @@ def stage_download_and_build(classA_df, pdb_dir, output_pdbs_dir, threads):
     """
     # ── Pre-fetch ESM Atlas structures in background (concurrent with AFDB downloads)
     _esm_fetch_thread = None
-    if _HAS_DB_TYPE and 'db_type' in classA_df.columns:
+    if 'db_type' in classA_df.columns:
         esm_df = classA_df.filter(pl.col('db_type') == 'esm_atlas')
         if len(esm_df) > 0:
             n_esm = esm_df['protein_hash'].n_unique()
             print(f'  Pre-fetching {n_esm} unique ESM Atlas structure(s) (background)...', flush=True)
             _esm_fetch_thread = threading.Thread(
-                target=_fetch_esm_pdbs, args=(esm_df, pdb_dir),
+                target=fetch_esm_structures,
+                args=(esm_df.unique(subset=['protein_hash']).to_dicts(), pdb_dir),
                 kwargs={'n_workers': 16}, daemon=True)
             _esm_fetch_thread.start()
 
     query_hits = defaultdict(list)
-    for row in classA_df.sort('jaccard', descending=True).iter_rows(named=True):
+    for row in classA_df.sort('containment_value', descending=True).iter_rows(named=True):
         query_hits[row['qseqid']].append(row)
 
     # Map each afdb_id to the queries for which it is the primary (rank-0) hit.
@@ -899,7 +740,7 @@ def stage_download_and_build(classA_df, pdb_dir, output_pdbs_dir, threads):
         return False, (hits[0].get('db_type') or 'afdb')
 
     # ── download all primary PDBs ──────────────────────────────────────────
-    results = asyncio.run(_fetch_all_aiohttp(list(all_aids), pdb_dir))
+    results = fetch_afdb_pdbs(all_aids, pdb_dir)
 
     # ── trigger builds for successfully downloaded primary hits ────────────
     for aid, r in results.items():
@@ -919,12 +760,6 @@ def stage_download_and_build(classA_df, pdb_dir, output_pdbs_dir, threads):
     if _esm_fetch_thread is not None:
         _esm_fetch_thread.join()
 
-    # ── retry failed downloads ─────────────────────────────────────────────
-    retry = [aid for aid, r in results.items() if r.startswith('fail')]
-    if retry:
-        print(f'  Retrying {len(retry)} failed download(s)...')
-        results.update(asyncio.run(_fetch_all_aiohttp(retry, pdb_dir)))
-
     # ── final pass: build any queries whose primary download failed ────────
     for qseqid in query_hits:
         if qseqid not in built:
@@ -936,15 +771,6 @@ def stage_download_and_build(classA_df, pdb_dir, output_pdbs_dir, threads):
                 else:
                     n_fail += 1; fail_by_db[db] += 1
                 _write_counts()
-
-    all_results = list(results.values())
-    summary = Counter(r.split(':')[0] for r in all_results)
-    for r in all_results:
-        if r.startswith('fail'):
-            print(f'  FAILED: {r}')
-    print(f"  Downloaded: {summary['downloaded']}  "
-          f"Already present: {summary['exists']}  "
-          f"Failed: {summary.get('failed', 0) + summary.get('fail', 0)}")
 
     return n_ok, n_fail, timings, ok_by_db, fail_by_db
 
@@ -960,7 +786,7 @@ def _try_build_pdb(row, pdb_dir, out_pdb):
     db_type = row.get('db_type', 'afdb') or 'afdb'
     if db_type == 'esm_atlas':
         protein_hash = row.get('protein_hash') or sseqid.split('|')[0]
-        src_pdb = _esm_local_pdb(protein_hash, pdb_dir)
+        src_pdb = esm_local_pdb(protein_hash, pdb_dir)
         if not os.path.exists(src_pdb):
             return f'ESM Atlas PDB not cached ({protein_hash})'
     else:
@@ -1003,7 +829,7 @@ def stage_build_pdbs(classA_df, pdb_dir, output_pdbs_dir):
     n_ok = n_fail = 0
     timings = []
     query_hits = defaultdict(list)
-    for row in classA_df.sort('jaccard', descending=True).iter_rows(named=True):
+    for row in classA_df.sort('containment_value', descending=True).iter_rows(named=True):
         query_hits[row['qseqid']].append(row)
 
     items = list(query_hits.items())
@@ -1120,13 +946,17 @@ def main():
     t2 = time.time()
 
     _all_hits: list[pl.DataFrame] = []
+    _classA_ids: set[str] = set()   # queries confirmed Class A after each DB
+    _current_fasta   = filtered_fasta
+    _current_seq_dict = query_seq_dict
+
     for _db_idx, _db_path in enumerate(_db_paths):
         if len(_db_paths) > 1:
             _label = _db_path or '(default AFDB)'
-            print(f'\n  DB {_db_idx + 1}/{len(_db_paths)}: {_label}')
-            _configure_db(_db_path)  # reconfigure globals for this DB
-        _hits_part = stage_kmer_search(filtered_fasta, query_seq_dict, kmer_out, args.top_k)
-        # Ensure every DataFrame has a db_type column so they stack cleanly.
+            print(f'\n  DB {_db_idx + 1}/{len(_db_paths)}: {_label}'
+                  + (f'  ({len(_current_seq_dict)} queries remaining)' if _db_idx > 0 else ''))
+            _configure_db(_db_path)
+        _hits_part = stage_kmer_search(_current_fasta, _current_seq_dict, kmer_out, args.top_k)
         if 'db_type' not in _hits_part.columns and len(_hits_part) > 0:
             _hits_part = _hits_part.with_columns([
                 pl.lit('afdb').alias('db_type'),
@@ -1137,13 +967,36 @@ def main():
             ])
         _all_hits.append(_hits_part)
 
+        # After each DB except the last: classify hits so far, exclude confirmed
+        # Class A queries from subsequent DB searches.
+        if _db_idx < len(_db_paths) - 1 and len(_hits_part) > 0:
+            _hits_so_far = pl.concat(_all_hits, how='diagonal_relaxed').filter(
+                pl.col('full_qseq').str.len_chars() > 0,
+                pl.col('full_sseq').str.len_chars() > 0,
+            )
+            print(f'  Classifying hits from DB {_db_idx + 1} to skip confirmed Class A queries...')
+            _t_cls = time.time()
+            _interim_classA = stage_align_and_classify(
+                _hits_so_far, args.window_size, args.pctsim / 100, args.threads)
+            _new_classA = set(_interim_classA['qseqid'].to_list()) - _classA_ids
+            _classA_ids |= _new_classA
+            print(f'  {len(_classA_ids)} Class A confirmed so far — '
+                  f'skipping from remaining DB searches  [{time.time()-_t_cls:.1f}s]')
+
+            # Write reduced FASTA for next DB search.
+            _current_seq_dict = {k: v for k, v in query_seq_dict.items()
+                                 if k not in _classA_ids}
+            _current_fasta = os.path.join(outdir, 'input_seqs_remaining.fa')
+            with open(_current_fasta, 'w') as _ff:
+                _ff.write('\n'.join(f'>{k}\n{v}' for k, v in _current_seq_dict.items()))
+            print(f'  {len(_current_seq_dict)} queries remaining for next DB')
+
     if len(_all_hits) == 1:
         hits_df = _all_hits[0]
     else:
         hits_df = pl.concat(_all_hits, how='diagonal_relaxed')
-        # Keep best-jaccard hit per (query, subject) pair across all DBs.
         hits_df = (hits_df
-                   .sort('jaccard', descending=True)
+                   .sort('containment_value', descending=True)
                    .unique(subset=['qseqid', 'sseqid'], keep='first'))
         print(f'\n  Merged hits from {len(_db_paths)} databases: {len(hits_df)} unique (qseqid, sseqid) pairs')
 
@@ -1157,7 +1010,6 @@ def main():
         print('\nNo kmer hits found. Exiting.')
         return
 
-    # Filter out hits with empty sequences (shouldn't happen but guard)
     hits_df = hits_df.filter(
         pl.col('full_qseq').str.len_chars() > 0,
         pl.col('full_sseq').str.len_chars() > 0,

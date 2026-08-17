@@ -30,15 +30,13 @@ import subprocess
 import time
 import argparse
 from pathlib import Path
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
-from urllib.parse import urlparse
-
 import polars as pl
 import parasail
-import pycurl
 import gemmi
-from Bio import SeqIO
+from alphatracer.utils.structures_fetch import (
+    AFDB_VERSION, get_afdb_id, afdb_url, afdb_local_pdb, is_valid_pdb,
+    fetch_afdb_pdbs, parse_fasta,
+)
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -179,54 +177,13 @@ def is_classA(qseq_alg: str, sseq_alg: str, alg_comp: str,
     return all_windows_pass(comp_core, window, threshold)
 
 
-# ── AFDB helpers ───────────────────────────────────────────────────────────────
-
-def get_afdb_id(sseqid: str) -> str | None:
-    """Extract the AlphaFold accession from a sseqid field.
-
-    Handles 'sp:AF-XXXX-F1', 'AF-XXXX-F1', and the common DIAMOND DB format
-    where the version suffix is already present ('AF-XXXX-F1-model_v4').
-    Always returns the bare accession WITHOUT the '-model_v4' version suffix
-    so that afdb_url() and afdb_local_pdb() can append it consistently.
-
-    >>> get_afdb_id('sp:AF-A0A000-F1')
-    'AF-A0A000-F1'
-    >>> get_afdb_id('AF-A0A000-F1')
-    'AF-A0A000-F1'
-    >>> get_afdb_id('AF-A0A000-F1-model_v4')
-    'AF-A0A000-F1'
-    >>> get_afdb_id('unknown') is None
-    True
-    """
-    if ':' in sseqid:
-        acc = sseqid.split(':')[1]
-    elif sseqid.startswith('AF-'):
-        acc = sseqid
-    else:
-        return None
-    # Strip any version suffix already present (e.g. -model_v4, -model_v6)
-    acc = re.sub(r'-model_v\d+$', '', acc)
-    return acc
-
-
-AFDB_VERSION = 6
-
-
-def afdb_local_pdb(afdb_id: str, pdb_dir: str) -> str:
-    return os.path.join(pdb_dir, f'{afdb_id}-model_v{AFDB_VERSION}.pdb')
-
-
-def afdb_url(afdb_id: str) -> str:
-    return f'https://alphafold.ebi.ac.uk/files/{afdb_id}-model_v{AFDB_VERSION}.pdb'
-
-
 # ── Stage 1: filter FASTA ──────────────────────────────────────────────────────
 
 def stage_filter(input_path: str, output_path: str) -> int:
     """Write filtered FASTA (no 'X', <= 2000 aa). Returns count written."""
     filtered = []
-    for record in SeqIO.parse(input_path, 'fasta'):
-        if 'X' not in str(record.seq) and len(record.seq) <= 2000:
+    for record in parse_fasta(input_path):
+        if 'X' not in record.seq and len(record.seq) <= 2000:
             filtered.append(f'>{record.id}\n{record.seq}')
     with open(output_path, 'w') as f:
         f.write('\n'.join(filtered))
@@ -352,68 +309,7 @@ def stage_download(classA_df: pl.DataFrame, pdb_dir: str, threads: int):
         if get_afdb_id(sid) is not None
     }
     print(f'  {len(afdb_ids)} unique AlphaFold accession(s) to download (v{AFDB_VERSION})')
-
-    def _is_valid_pdb(path: str) -> bool:
-        """Return True if the file looks like a PDB (starts with a PDB record keyword)."""
-        try:
-            with open(path, 'rb') as f:
-                header = f.read(6).decode('ascii', errors='ignore')
-            return header.strip()[:6] in ('HEADER', 'REMARK', 'ATOM  ', 'MODEL ')
-        except Exception:
-            return False
-
-    def _fetch(afdb_id):
-        path = afdb_local_pdb(afdb_id, pdb_dir)
-        filename = os.path.basename(path)
-        if os.path.exists(path) and _is_valid_pdb(path):
-            return f'exists:{filename}'
-        url = f'https://alphafold.ebi.ac.uk/files/{filename}'
-        try:
-            with open(path, 'wb') as f:
-                c = pycurl.Curl()
-                c.setopt(c.URL, url)
-                c.setopt(c.WRITEDATA, f)
-                c.perform()
-                c.close()
-            if _is_valid_pdb(path):
-                return f'downloaded:{filename}'
-            os.remove(path)
-            return f'failed:{afdb_id}:server returned non-PDB content'
-        except Exception as e:
-            if os.path.exists(path):
-                os.remove(path)
-            return f'failed:{afdb_id}:{e}'
-
-    # ── first pass (threaded) ──────────────────────────────────────────────
-    afdb_list = list(afdb_ids)
-    with ThreadPoolExecutor(max_workers=min(32, len(afdb_list))) as ex:
-        futures = {ex.submit(_fetch, aid): aid for aid in afdb_list}
-        results = {}
-        for fut in as_completed(futures):
-            aid = futures[fut]
-            r = fut.result()
-            results[aid] = r
-            if r.startswith('fail'):
-                time.sleep(0.5)
-
-    # ── retry failures ─────────────────────────────────────────────────────
-    retry = [aid for aid, r in results.items() if r.startswith('fail')]
-    if retry:
-        print(f'  Retrying {len(retry)} failed download(s)...')
-        for aid in retry:
-            r = _fetch(aid)
-            results[aid] = r
-            if r.startswith('fail'):
-                time.sleep(0.5)
-
-    all_results = list(results.values())
-    summary = Counter(r.split(':')[0] for r in all_results)
-    for r in all_results:
-        if r.startswith('fail'):
-            print(f'  FAILED: {r}')
-    print(f"  Downloaded: {summary['downloaded']}  "
-          f"Already present: {summary['exists']}  "
-          f"Failed: {summary.get('failed', 0) + summary.get('fail', 0)}")
+    fetch_afdb_pdbs(afdb_ids, pdb_dir)
 
 
 # ── Stage 5: build output PDBs ─────────────────────────────────────────────────
@@ -559,7 +455,7 @@ def main():
     # ── 1. Filter ──────────────────────────────────────────────────────────────
     print('[1/4] Filtering input FASTA...')
     filtered_fasta = os.path.join(outdir, 'input_seqs_filtered.fa')
-    n_in       = sum(1 for _ in SeqIO.parse(args.input, 'fasta'))
+    n_in       = sum(1 for _ in parse_fasta(args.input))
     n_filtered = stage_filter(args.input, filtered_fasta)
     while not (os.path.exists(filtered_fasta) and os.path.getsize(filtered_fasta) > 0):
         time.sleep(0.2)

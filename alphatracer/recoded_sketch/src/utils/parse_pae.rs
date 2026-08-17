@@ -75,10 +75,7 @@ fn main() {
 
         out.write_all(&(n as u32).to_le_bytes()).unwrap();
         out.write_all(&(n_out as u32).to_le_bytes()).unwrap();
-        let bytes = unsafe {
-            std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4)
-        };
-        out.write_all(bytes).unwrap();
+        for v in &values { out.write_all(&v.to_le_bytes()).unwrap(); }
     }
 }
 

@@ -21,19 +21,21 @@ Usage
 
 import os
 import re
-import io
 import sys
 import time
 import argparse
-import asyncio
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import aiohttp
 import numpy as np
 import polars as pl
 import parasail
 import gemmi
+
+from alphatracer.utils.structures_fetch import (
+    AFDB_VERSION, get_afdb_id, afdb_local_pdb, is_valid_pdb,
+    esm_local_pdb, _ESM_DIR, fetch_afdb_pdbs, fetch_esm_structures,
+)
 from openmm import (System, HarmonicBondForce, HarmonicAngleForce,
                     PeriodicTorsionForce, LangevinMiddleIntegrator, Platform)
 from openmm.app import Topology, Simulation, PDBFile, Element
@@ -49,7 +51,7 @@ ONE_TO_THREE = {
     'S': 'SER', 'T': 'THR', 'V': 'VAL', 'W': 'TRP', 'Y': 'TYR',
 }
 
-AFDB_VERSION = 6
+# AFDB_VERSION imported from alphatracer.utils.structures_fetch
 
 # Ideal backbone geometry (Å and radians)
 _BL = {'C-N': 1.335, 'N-CA': 1.460, 'CA-C': 1.522, 'C-O': 1.229, 'CA-CB': 1.526}
@@ -130,144 +132,15 @@ def parse_args():
     return p.parse_args()
 
 
-# ── AFDB helpers ──────────────────────────────────────────────────────────────
-
-def get_afdb_id(sseqid):
-    if ':' in sseqid:
-        acc = sseqid.split(':')[1]
-    elif sseqid.startswith('AF-'):
-        acc = sseqid
-    else:
-        return None
-    return re.sub(r'-model_v\d+$', '', acc)
-
-def afdb_local_pdb(afdb_id, pdb_dir):
-    return os.path.join(pdb_dir, f'{afdb_id}-model_v{AFDB_VERSION}.pdb')
-
-def _esm_local_pdb(protein_hash, pdb_dir):
-    return os.path.join(pdb_dir, f'esm_{protein_hash}.pdb')
+# get_afdb_id, afdb_local_pdb, esm_local_pdb (_esm_local_pdb alias below),
+# _ESM_DIR, is_valid_pdb (_is_valid_pdb alias below), fetch_afdb_pdbs,
+# fetch_esm_structures — all imported from alphatracer.utils.structures_fetch
 
 _HAS_DB_TYPE = False  # overridden at runtime by auto-detection from allhits.pq
-_ESM_DIR = os.environ.get('AT_ESM_DIR',
-               os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            '..', '..', '..', '..', 'Data', 'ESMAtlas'))
 
-
-def _fetch_esm_pdbs_classB(esm_rows, pdb_dir, n_workers=8, pae_dir=None):
-    """Batch-fetch ESM Atlas structure blobs from Lance and write as PDB files."""
-    esm_dir = os.path.abspath(_ESM_DIR)
-    if esm_dir not in sys.path:
-        sys.path.insert(0, esm_dir)
-    try:
-        import esm_query as _esm
-    except ImportError:
-        print(f'  [WARN] Cannot import esm_query from {esm_dir} — ESM Atlas hits will be skipped')
-        return
-
-    # Collect protein_hashes; resolve fragment coords via lookup_hashes if missing.
-    hits, need_lookup, seen = [], [], set()
-    for row in esm_rows:
-        ph  = row.get('protein_hash') or ''
-        fid = row.get('fragment_id', -1)
-        fr  = row.get('frag_row', -1)
-        if not ph or ph in seen:
-            continue
-        seen.add(ph)
-        if os.path.exists(_esm_local_pdb(ph, pdb_dir)):
-            continue
-        if fid is not None and fid >= 0 and fr is not None and fr >= 0:
-            hits.append({'fragment_id': fid, 'frag_row': fr, 'protein_hash': ph})
-        else:
-            need_lookup.append(ph)
-
-    if need_lookup:
-        print(f'  Resolving {len(need_lookup)} ESM protein_hash(es) via local index...', flush=True)
-        try:
-            idx = _esm.lookup_hashes(need_lookup)
-            for ph, fid, fr in zip(idx['protein_hash'].to_pylist(),
-                                    idx['fragment_id'].to_pylist(),
-                                    idx['frag_row'].to_pylist()):
-                if fid >= 0 and fr >= 0:
-                    hits.append({'fragment_id': int(fid), 'frag_row': int(fr), 'protein_hash': ph})
-                else:
-                    print(f'  [WARN] No index entry for ESM protein_hash {ph} — skipping', flush=True)
-        except Exception as e:
-            print(f'  [WARN] ESM lookup_hashes failed: {e}', flush=True)
-
-    if not hits:
-        return
-
-    fetch_pae = pae_dir is not None
-    cols = ['protein_hash', 'structure_blob', 'pae'] if fetch_pae else ['protein_hash', 'structure_blob']
-    if fetch_pae:
-        os.makedirs(pae_dir, exist_ok=True)
-
-    print(f'  Fetching {len(hits)} ESM Atlas structure(s) from S3'
-          f'{" + PAE" if fetch_pae else ""}...', flush=True)
-    t0 = time.time()
-
-    if fetch_pae:
-        # Use Lance directly to fetch structure_blob + pae in one round-trip per fragment
-        import io as _io, zipfile as _zf, pyarrow as _pa, numpy as _np
-        from collections import defaultdict as _dd
-        try:
-            ds = _esm._get_dataset()
-            by_frag = _dd(list)
-            for h in hits:
-                by_frag[h['fragment_id']].append(h['fragment_id'] * 10000 + h['frag_row'])
-            from concurrent.futures import ThreadPoolExecutor as _TPE
-            with _TPE(max_workers=n_workers) as exe:
-                tables = list(exe.map(
-                    lambda ids: ds.take(ids, columns=cols), by_frag.values()
-                ))
-            results = _pa.concat_tables(tables)
-        except Exception as e:
-            print(f'  [WARN] ESM Atlas Lance fetch failed: {type(e).__name__}: {e}')
-            return
-    else:
-        try:
-            results = _esm.query_from_hits(hits, columns=cols, n_workers=n_workers)
-        except Exception as e:
-            print(f'  [WARN] ESM Atlas fetch failed: {type(e).__name__}: {e}')
-            return
-
-    n_pdb = n_pae = 0
-    for batch in results.to_batches():
-        hashes = batch['protein_hash'].to_pylist()
-        blobs  = batch['structure_blob'].to_pylist()
-        paes   = batch['pae'].to_pylist() if fetch_pae else [None] * len(hashes)
-        for ph, blob, pae_bytes in zip(hashes, blobs, paes):
-            pdb_path = _esm_local_pdb(ph, pdb_dir)
-            if blob is not None:
-                try:
-                    with open(pdb_path, 'w') as f:
-                        f.write(_esm.blob_to_pdb(blob))
-                    n_pdb += 1
-                except Exception as e:
-                    print(f'  [WARN] ESM Atlas decode failed for {ph}: {e}')
-            if fetch_pae and pae_bytes is not None:
-                npy_path = os.path.join(pae_dir, f'esm_{ph}.pae.npy')
-                try:
-                    with _zf.ZipFile(_io.BytesIO(pae_bytes)) as zf:
-                        arr = _np.load(_io.BytesIO(zf.read(zf.namelist()[0])))
-                    _np.save(npy_path, arr.astype(_np.float32) / 8.0)
-                    n_pae += 1
-                except Exception as e:
-                    print(f'  [WARN] ESM PAE decode failed for {ph}: {e}')
-
-    msg = f'  Fetched {n_pdb}/{len(hits)} ESM structures'
-    if fetch_pae:
-        msg += f', {n_pae}/{len(hits)} PAE matrices'
-    print(msg + f' in {time.time()-t0:.1f}s', flush=True)
-
-
-def _is_valid_pdb(path):
-    try:
-        with open(path, 'rb') as f:
-            h = f.read(6).decode('ascii', errors='ignore')
-        return h.strip()[:6] in ('HEADER', 'REMARK', 'ATOM  ', 'MODEL ')
-    except Exception:
-        return False
+# Aliases for backward-compat with internal calls in this module
+_esm_local_pdb = esm_local_pdb
+_is_valid_pdb  = is_valid_pdb
 
 
 # ── Alignment ─────────────────────────────────────────────────────────────────
@@ -1202,7 +1075,7 @@ def build_classB_structure(row, pdb_dir, out_pdb, mm_iters, ccd_iters,
 
         # ── 4b. ProMod3 loop closing (replaces CCD when requested) ────────────
         if loop_closer == 'promod3':
-            from alphatracer.loop_closer import close_gap_promod3
+            from alphatracer.utils.loop_closer import close_gap_promod3
             import gemmi as _gemmi
             import tempfile as _tempfile
             import os as _os
@@ -1278,51 +1151,11 @@ def build_classB_structure(row, pdb_dir, out_pdb, mm_iters, ccd_iters,
 def stage_download(afdb_ids, pdb_dir, threads):
     missing = [aid for aid in afdb_ids
                if not (os.path.exists(afdb_local_pdb(aid, pdb_dir))
-                       and _is_valid_pdb(afdb_local_pdb(aid, pdb_dir)))]
+                       and is_valid_pdb(afdb_local_pdb(aid, pdb_dir)))]
     print(f'  {len(afdb_ids)} accessions; {len(missing)} to download')
     if not missing:
         return
-
-    async def _fetch_all(aids):
-        sem = asyncio.Semaphore(64)
-        connector = aiohttp.TCPConnector(limit=64)
-
-        async def _fetch_one(session, aid):
-            path = afdb_local_pdb(aid, pdb_dir)
-            url  = f'https://alphafold.ebi.ac.uk/files/{os.path.basename(path)}'
-            async with sem:
-                try:
-                    async with session.get(url) as resp:
-                        data = await resp.read()
-                    with open(path, 'wb') as f:
-                        f.write(data)
-                    if _is_valid_pdb(path):
-                        return aid, f'ok:{aid}'
-                    os.remove(path)
-                    return aid, f'fail:{aid}:non-PDB'
-                except Exception as e:
-                    if os.path.exists(path):
-                        os.remove(path)
-                    return aid, f'fail:{aid}:{e}'
-
-        async with aiohttp.ClientSession(connector=connector) as session:
-            return dict(await asyncio.gather(*[_fetch_one(session, aid) for aid in aids]))
-
-    # ── first pass ────────────────────────────────────────────────────────
-    results = asyncio.run(_fetch_all(missing))
-
-    # ── retry failures ─────────────────────────────────────────────────────
-    retry = [aid for aid, r in results.items() if r.startswith('fail')]
-    if retry:
-        print(f'  Retrying {len(retry)} failed download(s)...')
-        results.update(asyncio.run(_fetch_all(retry)))
-
-    all_results = list(results.values())
-    n_ok = sum(1 for r in all_results if r.startswith('ok'))
-    for r in all_results:
-        if r.startswith('fail'):
-            print(f'  FAILED: {r}')
-    print(f'  Downloaded: {n_ok}  Failed: {len(all_results) - n_ok}')
+    fetch_afdb_pdbs(missing, pdb_dir)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1370,7 +1203,7 @@ def main():
         sys.exit(f'classA.pq not found in {indir}')
     classA_ids = set(pl.read_parquet(classA_path)['qseqid'].to_list())
 
-    _sort_col = 'jaccard' if 'jaccard' in hits_df.columns else 'approx_pident'
+    _sort_col = 'containment_value' if 'containment_value' in hits_df.columns else 'approx_pident'
     non_classA = hits_df
     if 'approx_pident' in hits_df.columns:
         non_classA = non_classA.filter(pl.col('approx_pident') >= args.min_pctsim)
@@ -1474,7 +1307,7 @@ def main():
         import threading as _threading
         print(f'  Pre-fetching {len(esm_rows)} ESM Atlas structure(s) (background)...')
         _esm_thread = _threading.Thread(
-            target=_fetch_esm_pdbs_classB, args=(esm_rows, pdb_dir),
+            target=fetch_esm_structures, args=(esm_rows, pdb_dir),
             kwargs={'n_workers': 16}, daemon=True)
         _esm_thread.start()
     else:

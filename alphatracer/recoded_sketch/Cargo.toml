@@ -1,51 +1,41 @@
 [package]
-name = "sketch-rs"
+name = "recoded-sketch"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "recoded_sketch"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
 [[bin]]
 name = "sketch"
-path = "src/main.rs"
+path = "src/create_sketch.rs"
 
 [[bin]]
 name = "search"
 path = "src/search.rs"
 
 [[bin]]
-name = "build-index"
-path = "src/build_index.rs"
-
-[[bin]]
 name = "index-seqs"
 path = "src/index_seqs.rs"
 
 [[bin]]
-name = "cluster"
-path = "src/cluster.rs"
-
-[[bin]]
 name = "parse-pae"
-path = "src/parse_pae.rs"
-
-[[bin]]
-name = "bench-kmer"
-path = "src/bench_kmer.rs"
-
-[[bin]]
-name = "bench-hnsw"
-path = "src/bench_hnsw.rs"
+path = "src/utils/parse_pae.rs"
 
 [dependencies]
-kmerutils = "0.0.14"
-hnsw_rs = "0.3"
 rayon = "1"
 parquet = { version = "55", features = ["arrow"] }
 arrow-array = "55"
 arrow-schema = "55"
-arrow-cast = "55"
 rustc-hash = "2"
 needletail = "0.6"
 memmap2 = "0.9"
+pyo3 = { version = "0.22", optional = true, features = ["extension-module"] }
+
+[features]
+extension-module = ["pyo3/extension-module"]
 
 [profile.release]
 opt-level = 3

@@ -14,14 +14,10 @@ requires-python = ">=3.11"
 dependencies = [
     # Data / IO
     "polars>=1.0",
-    "pyarrow>=14.0",
     "duckdb>=1.0",
-    "biopython>=1.80",
     # Alignment / structure
     "parasail>=1.3",
     "gemmi>=0.6",
-    # Network
-    "pycurl>=7.45",
     # Numerics
     "numpy>=1.26",
     "scipy>=1.12",
@@ -40,10 +36,9 @@ mlx = [
     "minifold-mlx>=0.1.0",
 ]
 
-# Linux / cloud — PyTorch + ESM2 inference backend
+# Linux / cloud — PyTorch inference backend
 cuda = [
     "torch>=2.2",
-    "fair-esm>=2.0",
     # Install torch with CUDA support separately, e.g.:
     #   pip install torch --index-url https://download.pytorch.org/whl/cu121
     # Then: pip install git+https://github.com/jwohlwend/minifold.git
@@ -52,7 +47,6 @@ cuda = [
 # CPU-only fallback (same packages as cuda, CPU-only torch build)
 cpu = [
     "torch>=2.2",
-    "fair-esm>=2.0",
 ]
 
 # ProMod3 loop-closing backend — OST/ProMod3 must be installed at the system level;
@@ -70,7 +64,7 @@ where = ["."]
 include = ["alphatracer*"]
 
 [tool.setuptools.package-data]
-alphatracer = ["*.py", "sketch_rs/**/*"]
+alphatracer = ["*.py", "dayhoff_sketch/**/*"]
 
 # ── Bundled third-party code ───────────────────────────────────────────────────
 #

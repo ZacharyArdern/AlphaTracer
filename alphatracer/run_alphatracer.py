@@ -91,7 +91,11 @@ def _run_quiet(cmd: list[str], label: str, log_path: str,
 
 
 def _flag(name: str, value) -> list[str]:
-    return [name, str(value)] if value else []
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [name] + [str(v) for v in value]
+    return [name, str(value)]
 
 
 def _bool_flag(name: str, enabled: bool) -> list[str]:
@@ -117,18 +121,21 @@ def _count_fasta(path: str) -> int:
 
 
 class _StatusBar:
-    """Single updating status line shown during quiet-mode execution."""
+    """Four-line updating status block shown during quiet-mode execution."""
 
-    _BAR_WIDTH = 28
+    _OVR_BAR_W  = 28
+    _TASK_BAR_W = 20
+    _LABEL_W    = 18   # width of "Overall progress: " label field
 
     def __init__(self, proc_dir: str, total: int, log_path: str):
-        self.proc_dir  = proc_dir
-        self.total     = total
-        self.log_path  = log_path
-        self._phase    = 'Starting...'
-        self._stop     = threading.Event()
-        self._lock     = threading.Lock()   # guards _phase + stdout writes
-        self._thread   = threading.Thread(target=self._loop, daemon=True)
+        self.proc_dir      = proc_dir
+        self.total         = total
+        self.log_path      = log_path
+        self._phase        = 'Starting...'
+        self._stop         = threading.Event()
+        self._lock         = threading.Lock()   # guards _phase + stdout writes
+        self._thread       = threading.Thread(target=self._loop, daemon=True)
+        self._lines_drawn  = 0   # number of lines written by last _draw()
 
     def start(self) -> '_StatusBar':
         self._thread.start()
@@ -136,13 +143,7 @@ class _StatusBar:
 
     def phase(self, label: str) -> None:
         with self._lock:
-            if self._phase == label:
-                return
             self._phase = label
-            # Clear the current \r bar line, then print the phase as a permanent line.
-            # Hold _lock while writing so _draw() cannot interleave.
-            sys.stdout.write(f'\x1b[2K\r  {label}\n')
-            sys.stdout.flush()
 
     def stop(self) -> None:
         self._stop.set()
@@ -152,7 +153,6 @@ class _StatusBar:
     # ── internals ─────────────────────────────────────────────────────────────
 
     def _read_total_file(self, cls: str) -> int | None:
-        """Read .classX_total written by the subprocess once its candidate count is known."""
         try:
             with open(os.path.join(self.proc_dir, f'.class{cls}_total')) as f:
                 return int(f.read().strip())
@@ -160,7 +160,6 @@ class _StatusBar:
             return None
 
     def _class_A_total(self) -> int | None:
-        """Class A total from classA.pq written after kmer-classify phase."""
         try:
             import polars as pl
             pq = os.path.join(self.proc_dir, 'classA.pq')
@@ -169,19 +168,14 @@ class _StatusBar:
             return None
 
     def _class_counts(self) -> dict[str, tuple[int, int | None]]:
-        """Returns {cls: (done, total_or_None)} for each class."""
         result = {}
         for cls in ('A', 'B', 'C', 'D'):
             done = _count_pdbs(os.path.join(self.proc_dir, f'output_pdbs_class{cls}'))
-            if cls == 'A':
-                total = self._class_A_total()
-            else:
-                total = self._read_total_file(cls)
+            total = self._class_A_total() if cls == 'A' else self._read_total_file(cls)
             result[cls] = (done, total)
         return result
 
     def _read_db_counts(self, cls: str) -> dict | None:
-        """Read .classX_db_counts JSON written live by AT_classA/B scripts."""
         try:
             import json
             with open(os.path.join(self.proc_dir, f'.class{cls}_db_counts')) as f:
@@ -190,25 +184,54 @@ class _StatusBar:
             return None
 
     def _read_cd_status(self) -> str | None:
-        """Read subprocess status written by AT_classC_and_D.py to .cd_status."""
         try:
             with open(os.path.join(self.proc_dir, '.cd_status')) as f:
                 return f.read().strip() or None
         except Exception:
             return None
 
+    def _read_search_lines(self) -> tuple[str | None, str | None]:
+        """Return (task_line, progress_line) from the most recent Rust search output."""
+        try:
+            import re as _re
+            with open(self.log_path, 'rb') as f:
+                f.seek(0, 2); size = f.tell()
+                f.seek(max(0, size - 8192))
+                tail = f.read().decode('utf-8', errors='ignore')
+            task = None
+            progress = None
+            for line in reversed(tail.splitlines()):
+                clean = _re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
+                if not clean:
+                    continue
+                if progress is None and '%' in clean and '/' in clean and not clean.startswith('['):
+                    progress = clean
+                elif task is None and clean.startswith('[') and '/' in clean:
+                    task = clean
+                if task and progress:
+                    break
+            return task, progress
+        except Exception:
+            return None, None
+
     def _draw(self, final: bool = False) -> None:
+        import re as _re
         counts = self._class_counts()
         done   = sum(d for d, _ in counts.values())
         total  = self.total
         pct    = done / max(total, 1)
-        w      = self._BAR_WIDTH
-        filled = min(int(w * pct), w)
-        bar    = '█' * filled + '░' * (w - filled)
 
+        # Overall bar (blue)
+        w = self._OVR_BAR_W
+        filled = min(int(w * pct), w)
+        ovr_bar = '█' * filled + '░' * (w - filled)
+        ovr_str = f'\x1b[34m[{ovr_bar}] {done}/{total} seqs ({100*pct:.0f}%)\x1b[0m'
+
+        # Task detail and task bar
         active = [(k, d, t) for k, (d, t) in counts.items() if d > 0]
         if active:
             parts = []
+            first_known = None
             for k, d, t in active:
                 base = f'Class {k}: {d}/{t}' if t is not None else f'Class {k}: {d}'
                 if k in ('A', 'B'):
@@ -219,27 +242,70 @@ class _StatusBar:
                         esm  = ok.get('esm_atlas', 0)
                         base += f' (AF={afdb} ESM={esm})'
                 parts.append(base)
-            detail = '  '.join(parts)
+                if first_known is None and t is not None:
+                    first_known = (d, t)
+            task_detail = '  '.join(parts)
+            if first_known:
+                td, tt = first_known
+                tf = min(int(self._TASK_BAR_W * td / max(tt, 1)), self._TASK_BAR_W)
+                task_bar = '[' + '█' * tf + '░' * (self._TASK_BAR_W - tf) + '] '
+            else:
+                task_bar = ''
+            task_progress = task_bar + task_detail
+            task_desc = self._read_cd_status() or ''
         else:
-            with self._lock:
-                detail = self._phase
-
-        if final:
-            line = f'\x1b[2K\r  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  Done\n'
-        else:
-            cols = shutil.get_terminal_size((80, 24)).columns
-            content = f'  [{bar}] {done}/{total} seqs ({100*pct:.0f}%)  |  {detail}'
-            line = f'\x1b[2K\r{content[:cols - 1]}'
+            search_task, search_prog = self._read_search_lines()
+            task_desc = search_task or ''
+            task_progress = search_prog or ''
 
         with self._lock:
-            sys.stdout.write(line)
+            stage = self._phase
+
+        lw = self._LABEL_W
+        if final:
+            task_progress = 'Done'
+        rows = [
+            f'  {"Current stage:":<{lw}} {stage}',
+            f'  {"Task:":<{lw}} {task_desc}',
+            f'  {"Task progress:":<{lw}} {task_progress}',
+            f'  {"Overall progress:":<{lw}} {ovr_str}',
+        ]
+
+        # Truncate each row to terminal width so no line wraps (wrapping breaks
+        # the cursor-up logic because \x1b[nA counts logical newlines, not
+        # physical terminal lines).
+        tw = shutil.get_terminal_size((120, 24)).columns
+
+        def _trunc(s: str, w: int) -> str:
+            """Truncate to w visible chars, preserving ANSI escape codes."""
+            ansi_pat = _re.compile(r'\x1b\[[0-9;]*m')
+            visible, result, i = 0, [], 0
+            while i < len(s):
+                m = ansi_pat.match(s, i)
+                if m:
+                    result.append(m.group()); i = m.end()
+                else:
+                    if visible >= w:
+                        result.append('\x1b[0m')  # reset any open color
+                        break
+                    result.append(s[i]); visible += 1; i += 1
+            return ''.join(result)
+
+        rows = [_trunc(r, tw) for r in rows]
+
+        # Move cursor up to overwrite previous block, then redraw each line.
+        with self._lock:
+            out = ''
+            if self._lines_drawn:
+                out += f'\x1b[{self._lines_drawn}A'
+            for row in rows:
+                out += f'\x1b[2K\r{row}\n'
+            sys.stdout.write(out)
             sys.stdout.flush()
+            self._lines_drawn = len(rows)
 
     def _loop(self) -> None:
         while not self._stop.wait(0.5):
-            cd = self._read_cd_status()
-            if cd:
-                self.phase(cd)
             self._draw()
 
 
@@ -274,11 +340,11 @@ def parse_args() -> argparse.Namespace:
         help='DIAMOND database for Class A (only used with --diamond; '
              'default: bacarc8080.dmnd in --dbdir)',
     )
-    shared.add_argument('--top-k', type=int, default=5,
-                        help='Hits per query from kmer search (default: 5)')
-    shared.add_argument('--sketch-db', default=None, metavar='PATH',
-                        help='Custom sketch database parquet for kmer Class A search '
-                             '(e.g. ESMAtlas). Forwarded to AT_classA_kmer.py.')
+    shared.add_argument('--top-k', type=int, default=100,
+                        help='Hits per query from kmer search (default: 100)')
+    shared.add_argument('--sketch-db', default=None, nargs='+', metavar='PATH',
+                        help='Custom sketch database parquet(s) for kmer Class A search '
+                             '(e.g. AFDB, ESMAtlas). Multiple paths accepted. Forwarded to AT_classA_kmer.py.')
     shared.add_argument('-t', '--threads', type=int, default=4,
                         help='CPU threads')
     shared.add_argument('--mm-iters', type=int, default=300,
@@ -374,7 +440,7 @@ def parse_args() -> argparse.Namespace:
                         help='Skip Class D predictions')
     grp_cd.add_argument('--classD-limit', type=int, default=0,
                         help='Limit Class D to first N sequences (0=all)')
-    grp_cd.add_argument('--batch-tokens', type=int, default=262144,
+    grp_cd.add_argument('--batch-tokens', type=int, default=700000,
                         help='Max total tokens per MLX batch in Class D')
     grp_cd.add_argument('--max-seq-len', type=int, default=800,
                         help='Skip MLX prediction for sequences longer than this (0=no limit)')
@@ -668,6 +734,7 @@ def main() -> None:
             '--min-recycle-plddt',      str(args.min_recycle_plddt),
             '--batch-tokens',           str(args.batch_tokens),
             '--max-seq-len',            str(args.max_seq_len),
+            '--classC-top-k',           str(args.top_k),
             *_flag('--limit',        args.c_limit),
             *_flag('--classD-limit', args.classD_limit),
             *_bool_flag('--no-fill-missing', not args.fill_missing),

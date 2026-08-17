@@ -46,6 +46,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 import gemmi
+import parasail
 from openmm import LangevinMiddleIntegrator, CustomExternalForce
 from openmm.app import Simulation, PDBFile
 import openmm.unit as unit
@@ -80,11 +81,14 @@ if _PKG_PARENT not in sys.path:
 
 from alphatracer import AT_classA as _A
 from alphatracer import AT_classB as _B
-from alphatracer.pae_to_domains import (parse_pae_file, domains_from_pae_matrix_igraph,
-                                        parse_pae_batch_rust, domains_from_pae_subsampled)
+from alphatracer.utils.pae_to_domains import (parse_pae_file, domains_from_pae_matrix_igraph,
+                                               parse_pae_batch_rust, domains_from_pae_subsampled)
+from alphatracer.utils.structures_fetch import (
+    AFDB_VERSION, afdb_local_pdb, afdb_pae_local_path, afdb_pae_url,
+    esm_local_pdb, _ESM_DIR, fetch_afdb_pae, fetch_esm_structures,
+)
 
 ONE_TO_THREE = _A.ONE_TO_THREE
-AFDB_VERSION = _A.AFDB_VERSION
 
 # ── MiniFold-MLX weight paths (downloaded from HuggingFace on first use) ─────
 
@@ -115,6 +119,23 @@ def _get_weights(model_size='48L', use_quantized_esm=True):
 _MLX_STATE = None
 _PT_STATE  = None
 _USE_MLX   = None   # set on first _load_fold_models() call
+
+import threading as _threading
+_GPU_LOCK = _threading.Lock()  # serialise all MLX/GPU inference; C and D share this
+
+# Fragment kmer search (set by main() when fill_missing is active)
+_SEARCH_BIN        = None
+_AFDB_SIDX_PATH    = None
+_AFDB_PQ_PATH      = None
+_ESM_SIDX_PATH     = None
+_ESM_PQ_PATH       = None
+_FRAG_PDB_DIR      = None   # local PDB cache dir for fragment template downloads
+_FRAG_MIN_CONTAINMENT  = 0.08
+_FRAG_MIN_IDENTITY = 0.40   # same as default Class B min_pctsim
+_FRAG_MIN_COVERAGE = 0.70
+
+_afdb_pq_cache = None
+_esm_pq_cache  = None
 
 _STATUS_PATH = None  # set in main() to proc_dir/.cd_status
 
@@ -161,6 +182,8 @@ def parse_args():
     p.add_argument('--ccd-tol',             type=float, default=0.15)
     p.add_argument('--flank',               type=int,   default=3)
     p.add_argument('--limit',               type=int,   default=0)
+    p.add_argument('--classC-top-k',        type=int,   default=100,
+                   help='Max hits per query to NW-align before selecting best by coverage (default: 100)')
     p.add_argument('--no-fill-missing',     action='store_false', dest='fill_missing', default=True,
                    help='Fill non-domain regions with MLX MiniFold (classC)')
     p.add_argument('--min-frag-len',        type=int,   default=5)
@@ -204,55 +227,50 @@ def parse_args():
     return p.parse_args()
 
 
+# ── ESM fragment index lookup ─────────────────────────────────────────────────
+
+def _resolve_esm_fragment_ids(rows):
+    """Populate fragment_id/frag_row for ESM rows where they are -1 (diamond hits).
+    Looks up by first 32 chars of protein_hash in the local folds_1B_index."""
+    needs = [r for r in rows if r.get('fragment_id', -1) == -1 and r.get('protein_hash')]
+    if not needs:
+        return
+    import glob as _glob
+    esm_dir = os.path.abspath(_ESM_DIR)
+    index_dir = os.path.join(esm_dir, 'folds_1B_index', 'merged')
+    if not os.path.isdir(index_dir):
+        print(f'  [WARN] ESM fragment index not found at {index_dir} — PAE unavailable for diamond ESM hits')
+        return
+    # Group by prefix (first hex char of protein_hash) to read only needed files
+    by_prefix = {}
+    for r in needs:
+        ph = r['protein_hash'][:32]
+        by_prefix.setdefault(ph[0], []).append((r, ph))
+    ph_to_frag = {}
+    for prefix, entries in by_prefix.items():
+        pq_path = os.path.join(index_dir, f'prefix_{prefix}.parquet')
+        if not os.path.exists(pq_path):
+            continue
+        ph_set = {ph for _, ph in entries}
+        idx = pl.read_parquet(pq_path, columns=['protein_hash', 'fragment_id', 'frag_row'])
+        idx = idx.filter(pl.col('protein_hash').is_in(ph_set))
+        for row in idx.iter_rows(named=True):
+            ph_to_frag[row['protein_hash']] = (row['fragment_id'], row['frag_row'])
+    resolved = 0
+    for r, ph in [(r, r['protein_hash'][:32]) for r in needs]:
+        if ph in ph_to_frag:
+            r['fragment_id'], r['frag_row'] = ph_to_frag[ph]
+            resolved += 1
+    print(f'  [ESM index] Resolved fragment_id/frag_row for {resolved}/{len(needs)} diamond ESM hits')
+
+
 # ── PAE helpers ───────────────────────────────────────────────────────────────
 
-def _pae_local_path(afdb_id, pae_dir):
-    return os.path.join(pae_dir,
-                        f'{afdb_id}-predicted_aligned_error_v{AFDB_VERSION}.json')
+# _pae_local_path, _pae_url, stage_download_pae removed — use
+# afdb_pae_local_path, afdb_pae_url, fetch_afdb_pae from utils.structures_fetch
 
-def _pae_url(afdb_id):
-    return (f'https://alphafold.ebi.ac.uk/files/'
-            f'{afdb_id}-predicted_aligned_error_v{AFDB_VERSION}.json')
-
-def stage_download_pae(afdb_ids, pae_dir, threads):
-    os.makedirs(pae_dir, exist_ok=True)
-    missing = [aid for aid in sorted(afdb_ids)
-               if not os.path.exists(_pae_local_path(aid, pae_dir))]
-    print(f'  {len(afdb_ids)} accessions; {len(missing)} PAE files to download')
-    if not missing:
-        return
-
-    async def _fetch_all(aids):
-        sem = asyncio.Semaphore(64)
-        connector = aiohttp.TCPConnector(limit=64)
-        async def _fetch_one(session, aid):
-            path = _pae_local_path(aid, pae_dir)
-            url  = _pae_url(aid)
-            async with sem:
-                for attempt in range(3):
-                    try:
-                        async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                            resp.raise_for_status()
-                            data = await resp.read()
-                        with open(path, 'wb') as f:
-                            f.write(data)
-                        return f'ok:{aid}'
-                    except Exception as e:
-                        if os.path.exists(path):
-                            os.remove(path)
-                        if attempt == 2:
-                            return f'fail:{aid}:{e}'
-                        await asyncio.sleep(0.5 * (attempt + 1))
-            return f'fail:{aid}:unreachable'
-        async with aiohttp.ClientSession(connector=connector) as session:
-            return await asyncio.gather(*[_fetch_one(session, aid) for aid in aids])
-
-    all_results = asyncio.run(_fetch_all(missing))
-    n_ok = sum(1 for r in all_results if r.startswith('ok'))
-    for r in all_results:
-        if r.startswith('fail'):
-            print(f'  PAE FAILED: {r}')
-    print(f'  Downloaded: {n_ok}  Failed: {len(all_results) - n_ok}')
+# Alias for internal references still using the old name
+_pae_local_path = afdb_pae_local_path
 
 
 def _load_pae_matrix(pae_path):
@@ -563,7 +581,7 @@ def build_domain_pdb(domain_indices, ops, ref_poly, out_pdb,
 
         # ── ProMod3 loop closing (replaces CCD geometry when requested) ────────
         if loop_closer == 'promod3' and gap_sites:
-            from alphatracer.loop_closer import close_gap_promod3
+            from alphatracer.utils.loop_closer import close_gap_promod3
             trg_seq, tpl_seq = [], []
             for op in d_ops:
                 if op[0] == 'match':
@@ -1017,16 +1035,18 @@ def _load_fold_models(model_size='12L', compile_miniformer=True, backend='auto')
 
 def _fold_predict(seq, num_recycling):
     """Predict structure for a single sequence (dispatches to MLX or PyTorch)."""
-    if _USE_MLX:
-        return _mlx_predict(seq, num_recycling)
-    return _pt_predict(seq, num_recycling)
+    with _GPU_LOCK:
+        if _USE_MLX:
+            return _mlx_predict(seq, num_recycling)
+        return _pt_predict(seq, num_recycling)
 
 
 def _fold_predict_batch(batch_items, num_recycling):
     """Predict structures for a batch of sequences (dispatches to MLX or PyTorch)."""
-    if _USE_MLX:
-        return _mlx_predict_batch(batch_items, num_recycling)
-    return _pt_predict_batch(batch_items, num_recycling)
+    with _GPU_LOCK:
+        if _USE_MLX:
+            return _mlx_predict_batch(batch_items, num_recycling)
+        return _pt_predict_batch(batch_items, num_recycling)
 
 
 # ── Missing-region fill (fold prediction + CCD + L-BFGS-B) ──────────────────
@@ -1133,6 +1153,255 @@ def _predict_fragments_inprocess(frag_dict, work_dir,
         still_pending = next_pending
 
     return pdbs
+
+
+def _frag_template_search(frag_dict: dict, work_dir: str) -> tuple[dict, dict]:
+    """Search gap fragments against AFDB; return (still_novel, template_pdbs).
+
+    still_novel : {name: seq} fragments with no good AFDB hit → go to MiniFold
+    template_pdbs: {name: pdb_path} fragments covered by an AFDB template
+    """
+    import tempfile, subprocess as _sp
+    if not (_SEARCH_BIN and _AFDB_SIDX_PATH and _AFDB_PQ_PATH and _FRAG_PDB_DIR):
+        return frag_dict, {}
+    if not frag_dict:
+        return {}, {}
+
+    # Write query FASTA
+    fa_path = os.path.join(work_dir, '_frags_query.fa')
+    with open(fa_path, 'w') as fh:
+        for name, seq in frag_dict.items():
+            fh.write(f'>{name}\n{seq}\n')
+
+    # Run kmer search (top-3 hits per fragment, n_letters=5 same as pipeline)
+    try:
+        proc = _sp.run(
+            [_SEARCH_BIN, _AFDB_SIDX_PATH, fa_path, '3', '0', '0', '9', '0', '5'],
+            capture_output=True, text=True, timeout=30
+        )
+        lines = proc.stdout.strip().splitlines()
+    except Exception:
+        return frag_dict, {}
+
+    # Parse: query  row_idx  shared  containment_value
+    hits_by_frag: dict[str, list[tuple[int, float]]] = {}
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 4 or parts[0] == 'query':
+            continue
+        name, row_idx, _, containment_value = parts[0], int(parts[1]), parts[2], float(parts[3])
+        if containment_value >= _FRAG_MIN_CONTAINMENT:
+            hits_by_frag.setdefault(name, []).append((row_idx, containment_value))
+
+    if not hits_by_frag:
+        return frag_dict, {}
+
+    # Load AFDB parquet lazily (module-level cache to avoid repeated loads)
+    global _afdb_pq_cache
+    if _afdb_pq_cache is None:
+        try:
+            import polars as _pl
+            _afdb_pq_cache = _pl.read_parquet(_AFDB_PQ_PATH)
+        except Exception:
+            return frag_dict, {}
+
+    still_novel   = dict(frag_dict)
+    template_pdbs = {}
+    mat = parasail.blosum62
+
+    for frag_name, hit_list in hits_by_frag.items():
+        frag_seq = frag_dict.get(frag_name)
+        if frag_seq is None:
+            continue
+        best_hit = None
+        for row_idx, containment_value in sorted(hit_list, key=lambda x: -x[1]):
+            try:
+                db_row  = _afdb_pq_cache.row(row_idx, named=True)
+                db_seq  = db_row['rep_AFDB_ID'], db_row['sequence']
+                afdb_id, sseq = db_seq
+            except Exception:
+                continue
+            r = parasail.sw_trace_striped_16(frag_seq, sseq, 10, 1, mat)
+            qa, sa = r.traceback.query, r.traceback.ref
+            pairs   = [(q, s) for q, s in zip(qa, sa) if q != '-' and s != '-']
+            if not pairs:
+                continue
+            identity = sum(1 for q, s in pairs if q == s) / len(pairs)
+            coverage = len(pairs) / len(frag_seq)
+            if identity >= _FRAG_MIN_IDENTITY and coverage >= _FRAG_MIN_COVERAGE:
+                best_hit = (afdb_id, sseq, qa, sa, identity, coverage)
+                break
+
+        if best_hit is None:
+            continue
+
+        afdb_id, sseq, qa, sa, identity, coverage = best_hit
+
+        # Download AFDB PDB (uses existing local cache)
+        local_pdb = _A.afdb_local_pdb(afdb_id, _FRAG_PDB_DIR)
+        if not os.path.exists(local_pdb):
+            try:
+                from alphatracer.utils.structures_fetch import AFDB_VERSION
+                import urllib.request as _ur
+                url = (f'https://alphafold.ebi.ac.uk/files/'
+                       f'{afdb_id}-model_v{AFDB_VERSION}.pdb')
+                _ur.urlretrieve(url, local_pdb)
+            except Exception:
+                continue
+
+        # Extract fragment residues from the AFDB structure
+        try:
+            st     = gemmi.read_structure(local_pdb)
+            chain  = st[0]['A']
+            poly   = [r for r in chain if r.entity_type == gemmi.EntityType.Polymer]
+
+            # Find start residue index in subject via SW alignment
+            s_start = 0
+            for c in sa:
+                if c == '-':
+                    s_start += 1
+                else:
+                    break
+
+            frag_pdb_path = os.path.join(work_dir, f'{frag_name}_template.pdb')
+            doc = gemmi.Document()
+            new_st = gemmi.Structure()
+            new_model = gemmi.Model('1')
+            new_chain = gemmi.Chain('A')
+            q_idx = 0
+            s_idx = s_start
+            for q_c, s_c in zip(qa, sa):
+                if q_c != '-' and s_c != '-':
+                    if s_idx < len(poly):
+                        new_chain.add_residue(poly[s_idx])
+                if s_c != '-':
+                    s_idx += 1
+            new_model.add_chain(new_chain)
+            new_st.add_model(new_model)
+            new_st.write_pdb(frag_pdb_path)
+
+            still_novel.pop(frag_name, None)
+            template_pdbs[frag_name] = frag_pdb_path
+            print(f'    [{frag_name}] template from {afdb_id}  '
+                  f'identity={identity*100:.1f}%  coverage={coverage*100:.1f}%',
+                  flush=True)
+        except Exception as exc:
+            print(f'    [{frag_name}] template extraction failed: {exc}', flush=True)
+
+    # ── ESM Atlas cascade: search fragments that had no good AFDB hit ────────
+    if still_novel and _ESM_SIDX_PATH and _ESM_PQ_PATH and _FRAG_PDB_DIR:
+        global _esm_pq_cache
+        esm_fa = os.path.join(work_dir, '_frags_esm_query.fa')
+        with open(esm_fa, 'w') as fh:
+            for name, seq in still_novel.items():
+                fh.write(f'>{name}\n{seq}\n')
+
+        try:
+            proc = _sp.run(
+                [_SEARCH_BIN, _ESM_SIDX_PATH, esm_fa, '3', '0', '0', '9', '0', '5'],
+                capture_output=True, text=True, timeout=30
+            )
+            esm_lines = proc.stdout.strip().splitlines()
+        except Exception:
+            esm_lines = []
+
+        esm_hits_by_frag: dict[str, list[tuple[int, float]]] = {}
+        for line in esm_lines:
+            parts = line.split()
+            if len(parts) < 4 or parts[0] == 'query':
+                continue
+            name, row_idx, containment_value = parts[0], int(parts[1]), float(parts[3])
+            if containment_value >= _FRAG_MIN_CONTAINMENT:
+                esm_hits_by_frag.setdefault(name, []).append((row_idx, containment_value))
+
+        if esm_hits_by_frag:
+            if _esm_pq_cache is None:
+                try:
+                    import polars as _pl
+                    _esm_pq_cache = _pl.read_parquet(_ESM_PQ_PATH)
+                except Exception:
+                    esm_hits_by_frag = {}
+
+        for frag_name, hit_list in esm_hits_by_frag.items():
+            frag_seq = still_novel.get(frag_name)
+            if frag_seq is None:
+                continue
+            best_hit = None
+            for row_idx, containment_value in sorted(hit_list, key=lambda x: -x[1]):
+                try:
+                    db_row   = _esm_pq_cache.row(row_idx, named=True)
+                    prot_hash = db_row['header']
+                    esm_seq   = db_row['sequence']
+                except Exception:
+                    continue
+                r = parasail.sw_trace_striped_16(frag_seq, esm_seq, 10, 1, mat)
+                qa, sa = r.traceback.query, r.traceback.ref
+                pairs  = [(q, s) for q, s in zip(qa, sa) if q != '-' and s != '-']
+                if not pairs:
+                    continue
+                identity = sum(1 for q, s in pairs if q == s) / len(pairs)
+                coverage = len(pairs) / len(frag_seq)
+                if identity >= _FRAG_MIN_IDENTITY and coverage >= _FRAG_MIN_COVERAGE:
+                    best_hit = (prot_hash, esm_seq, qa, sa, identity, coverage)
+                    break
+
+            if best_hit is None:
+                continue
+
+            prot_hash, esm_seq, qa, sa, identity, coverage = best_hit
+
+            # Fetch ESM PDB if not cached
+            from alphatracer.utils.structures_fetch import (
+                fetch_esm_structures, esm_local_pdb as _esm_local_pdb)
+            local_pdb = _esm_local_pdb(prot_hash, _FRAG_PDB_DIR)
+            if not os.path.exists(local_pdb):
+                try:
+                    fetch_esm_structures(
+                        [{'protein_hash': prot_hash}], _FRAG_PDB_DIR)
+                except Exception as e:
+                    print(f'    [{frag_name}] ESM fetch failed: {e}', flush=True)
+                    continue
+
+            if not os.path.exists(local_pdb):
+                continue
+
+            # Extract fragment residues from ESM structure
+            try:
+                st    = gemmi.read_structure(local_pdb)
+                chain = st[0]['A']
+                poly  = [r for r in chain if r.entity_type == gemmi.EntityType.Polymer]
+
+                s_start = 0
+                for c in sa:
+                    if c == '-':
+                        s_start += 1
+                    else:
+                        break
+
+                frag_pdb_path = os.path.join(work_dir, f'{frag_name}_template.pdb')
+                new_st    = gemmi.Structure()
+                new_model = gemmi.Model('1')
+                new_chain = gemmi.Chain('A')
+                s_idx = s_start
+                for q_c, s_c in zip(qa, sa):
+                    if q_c != '-' and s_c != '-':
+                        if s_idx < len(poly):
+                            new_chain.add_residue(poly[s_idx])
+                    if s_c != '-':
+                        s_idx += 1
+                new_model.add_chain(new_chain)
+                new_st.add_model(new_model)
+                new_st.write_pdb(frag_pdb_path)
+
+                still_novel.pop(frag_name, None)
+                template_pdbs[frag_name] = frag_pdb_path
+                print(f'    [{frag_name}] ESM template from {prot_hash[:16]}  '
+                      f'identity={identity*100:.1f}%  coverage={coverage*100:.1f}%',
+                      flush=True)
+            except Exception as exc:
+                print(f'    [{frag_name}] ESM template extraction failed: {exc}', flush=True)
+
+    return still_novel, template_pdbs
 
 
 def _read_backbone_residues(pdb_path):
@@ -1289,9 +1558,11 @@ def build_complete_structure(
                 loop_closer=loop_closer)
 
         frag_dict = {f'frag_{i}': seg['seq'] for i, seg in enumerate(missing)}
+        # Search fragments against AFDB before falling back to MiniFold
+        novel_frags, template_pdbs = _frag_template_search(frag_dict, work_dir)
         try:
             frag_pdbs = _predict_fragments_inprocess(
-                frag_dict, work_dir,
+                novel_frags, work_dir,
                 plddt_threshold=plddt_threshold,
                 max_recyclings=max_recyclings,
                 min_recycle_plddt=min_recycle_plddt,
@@ -1304,6 +1575,8 @@ def build_complete_structure(
             return build_domain_pdb(
                 domain_indices, ops, ref_poly, out_pdb,
                 mm_iters, ccd_iters, ccd_tol, n_flank, anchor_k=anchor_k)
+
+        frag_pdbs.update(template_pdbs)
 
         all_segs = []
         dom_qp_start = min(r['qp'] for r in domain_seg)
@@ -1474,27 +1747,33 @@ def main():
 
     # ── [C-1] Alignment ───────────────────────────────────────────────────────
     exclude_ids = classA_ids | classB_ids
-    _sort_col = 'jaccard' if 'jaccard' in hits_df.columns else 'approx_pident'
+    _sort_col = 'containment_value' if 'containment_value' in hits_df.columns else 'approx_pident'
     candidates = hits_df
     if 'approx_pident' in hits_df.columns:
         candidates = candidates.filter(pl.col('approx_pident') >= args.min_pctsim)
+    top_k = args.classC_top_k
     candidates = (
         candidates
         .filter(~pl.col('qseqid').is_in(exclude_ids))
         .sort(_sort_col, descending=True)
         .group_by('qseqid', maintain_order=True)
-        .agg(pl.all().first())
+        .agg(pl.all().head(top_k))
+        .explode(pl.all().exclude('qseqid'))
     )
-    print(f'{len(classA_ids)} Class A + {len(classB_ids)} Class B excluded  |  {len(candidates)} candidates for Class C')
+    n_queries = candidates['qseqid'].n_unique()
+    print(f'{len(classA_ids)} Class A + {len(classB_ids)} Class B excluded  |  '
+          f'{n_queries} queries for Class C ({len(candidates)} candidates, top_k={top_k})')
     with open(os.path.join(indir, '.classC_total'), 'w') as _f:
-        _f.write(str(len(candidates)))
+        _f.write(str(n_queries))
 
     if args.limit > 0:
-        candidates = candidates.head(args.limit)
-        print(f'  (limited to first {args.limit})')
+        keep_ids = candidates['qseqid'].unique()[:args.limit].to_list()
+        candidates = candidates.filter(pl.col('qseqid').is_in(keep_ids))
+        print(f'  (limited to first {args.limit} queries)')
 
-    _write_status(f'Aligning {len(candidates)} Class C sequences...')
-    print(f'\n[C-1/4] Aligning {len(candidates)} sequences (threads={args.threads})...')
+    _write_status(f'Aligning {len(candidates)} Class C candidates ({n_queries} queries)...')
+    print(f'\n[C-1/4] Aligning {len(candidates)} candidates for {n_queries} queries '
+          f'(threads={args.threads})...')
     rows_list = list(candidates.iter_rows(named=True))
     total     = len(rows_list)
 
@@ -1520,36 +1799,58 @@ def main():
                           schema=['qseqid', 'sseqid', 'qseq_alg',
                                   'sseq_alg', 'alg_comp'],
                           orient='row')
-    merged = candidates.join(aln_df, on=['qseqid', 'sseqid'], how='inner')
+    # Select best hit per query by alignment coverage (matched residues / qlen)
+    def _coverage(r):
+        return sum(1 for a, b in zip(r['qseq_alg'], r['sseq_alg'])
+                   if a != '-' and b != '-') / max(r['qlen'], 1)
 
-    # ── [C-2/3] Download PAE+PDB, batch-parse PAE, qualify domains ───────────────
-    # Four phases:
-    #   2a. Parallel PAE download (all templates at once)
-    #   2b. Parallel PDB download + ref_poly load
-    #   2c. Batch Rust PAE parse (one subprocess, all files)
-    #   3.  Parallel domain detection + qualification using pre-parsed matrices
-    _write_status(f'Downloading PAE/PDB and detecting domains for {len(merged)} Class C sequences...')
-    print(f'\n[C-2+3/4] Downloading PAE+PDB and qualifying domains '
-          f'({len(merged)} sequences, pae-step={args.pae_step}, threads={args.threads})...')
+    merged = (
+        candidates.join(aln_df, on=['qseqid', 'sseqid'], how='inner')
+        .with_columns(
+            pl.struct(['qseq_alg', 'sseq_alg', 'qlen'])
+            .map_elements(_coverage, return_dtype=pl.Float64)
+            .alias('aln_coverage')
+        )
+        .sort('aln_coverage', descending=True)
+        .group_by('qseqid', maintain_order=True)
+        .agg(pl.all().first())
+        .drop('aln_coverage')
+    )
 
-    rows_by_afdb = {}
-    esm_rows_list = []
+    # ── [C-1b] C1/C2 split: classify by alignment coverage + identity ─────────
+    # C1: NW coverage ≥ 70% of qlen AND identity ≥ min_pctsim → use full aligned
+    #     region as template; MiniFold fills only the unmatched gaps.
+    # C2: weaker hits → PAE-based compact domain detection (original behaviour).
+    C1_COV_THRESH = 0.70
+    c1_rows_raw, c2_rows_raw = [], []
     for row in merged.iter_rows(named=True):
+        qa, sa = row['qseq_alg'], row['sseq_alg']
+        qlen   = len(row['full_qseq'])
+        pairs  = [(q, s) for q, s in zip(qa, sa) if q != '-' and s != '-']
+        if not pairs:
+            c2_rows_raw.append(row); continue
+        identity = sum(1 for q, s in pairs if q == s) / len(pairs)
+        coverage = len(pairs) / qlen
+        if coverage >= C1_COV_THRESH and identity >= threshold_frac:
+            c1_rows_raw.append(row)
+        else:
+            c2_rows_raw.append(row)
+    print(f'  C1 (high-coverage template): {len(c1_rows_raw)}  '
+          f'C2 (PAE domain):              {len(c2_rows_raw)}')
+
+    # ── [C-2+3/4-C1] C1: Download PDB only; domain = full aligned region ──────
+    c1_afdb_ids = set()
+    c1_esm_rows = []
+    for row in c1_rows_raw:
         aid = _A.get_afdb_id(row['sseqid'])
         if aid:
-            rows_by_afdb.setdefault(aid, []).append(row)
+            c1_afdb_ids.add(aid)
         else:
-            esm_rows_list.append(row)
+            c1_esm_rows.append(row)
 
-    all_afdb_ids = set(rows_by_afdb.keys())
-
-    # Phase 2a: Download all PAE files in parallel
-    print('  [2a] Downloading PAE files...')
-    stage_download_pae(all_afdb_ids, pae_dir, args.threads)
-
-    # Phase 2b: Download PDB files + load ref_poly in parallel
-    print('  [2b] Downloading PDB files...')
-    _B.stage_download(all_afdb_ids, pdb_dir, args.threads)
+    _write_status(f'Downloading PDB files for {len(c1_afdb_ids)} C1 templates...')
+    print(f'\n[C-2/4-C1] Downloading {len(c1_afdb_ids)} C1 PDB files...')
+    _B.stage_download(c1_afdb_ids, pdb_dir, args.threads)
     _ref_poly_cache = {}
 
     def _load_ref_poly(afdb_id):
@@ -1557,53 +1858,125 @@ def main():
         if not os.path.exists(src_pdb):
             return afdb_id, None
         try:
-            st = gemmi.read_structure(src_pdb)
-            poly = [r for r in st[0]['A'] if r.entity_type == gemmi.EntityType.Polymer]
+            st   = gemmi.read_structure(src_pdb)
+            poly = [r for r in st[0]['A']
+                    if r.entity_type == gemmi.EntityType.Polymer]
             return afdb_id, poly
         except Exception:
             return afdb_id, None
 
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
-        for aid, poly in ex.map(_load_ref_poly, sorted(all_afdb_ids)):
+        for aid, poly in ex.map(_load_ref_poly, sorted(c1_afdb_ids)):
             if poly is not None:
                 _ref_poly_cache[aid] = poly
 
-    # Phase 2b-ESM: Fetch ESM Atlas PDBs and load ref_poly
-    if esm_rows_list:
-        print(f'  [2b-ESM] Fetching {len(esm_rows_list)} ESM Atlas structure(s)...')
-        _B._fetch_esm_pdbs_classB(
+    # ESM PDBs for C1
+    if c1_esm_rows:
+        _resolve_esm_fragment_ids(c1_esm_rows)
+        fetch_esm_structures(
             [{'protein_hash': r.get('protein_hash') or r['sseqid'].split('|')[0],
               'fragment_id':  r.get('fragment_id', -1),
               'frag_row':     r.get('frag_row', -1)}
-             for r in esm_rows_list],
+             for r in c1_esm_rows],
             pdb_dir, n_workers=args.threads, pae_dir=pae_dir,
         )
         seen_ph = set()
-        for row in esm_rows_list:
+        for row in c1_esm_rows:
             ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
             if ph in seen_ph or ph in _ref_poly_cache:
                 continue
             seen_ph.add(ph)
-            src_pdb = _B._esm_local_pdb(ph, pdb_dir)
+            src_pdb = esm_local_pdb(ph, pdb_dir)
             if not os.path.exists(src_pdb):
                 continue
             try:
-                st = gemmi.read_structure(src_pdb)
-                # ESM PDBs have no ENTITY records so entity_type is Unknown;
-                # just take all residues in the first chain.
+                st   = gemmi.read_structure(src_pdb)
                 poly = list(st[0][0])
                 _ref_poly_cache[ph] = poly
             except Exception:
                 pass
 
-    # Phase 2c: Batch Rust parse with adaptive step size
-    # Small proteins (file < ~350 KB, n ≲ 300): step=2 (Jacc ~0.91, safe)
-    # Large proteins (file ≥ ~350 KB, n ≳ 300): step=3 (Jacc ~0.95+, largest-domain accurate)
-    # Override with --pae-step if provided (non-zero).
+    def _qualify_c1(row):
+        """C1: domain = all matched reference positions from NW alignment."""
+        aid  = _A.get_afdb_id(row['sseqid'])
+        key  = aid if aid else (row.get('protein_hash') or row['sseqid'].split('|')[0])
+        ref_poly = _ref_poly_cache.get(key)
+        if ref_poly is None:
+            return None, 'no_pdb'
+        _, ops = _B.parse_alignment_ops(row['qseq_alg'], row['sseq_alg'])
+        domain = [op[1] for op in ops if op[0] == 'match']
+        if len(domain) < args.min_domain_size:
+            return None, 'domain_too_small'
+        plddt_vals = [ref_poly[pos].find_atom('CA', '\0').b_iso
+                      for pos in domain if pos < len(ref_poly)
+                      and ref_poly[pos].find_atom('CA', '\0')]
+        if plddt_vals and (sum(plddt_vals) / len(plddt_vals)) < args.min_domain_plddt:
+            return None, 'domain_low_plddt'
+        return {**row, '_best_domain': domain, '_c1': True}, 'ok'
+
+    c1_qual_results = [_qualify_c1(row) for row in c1_rows_raw]
+
+    # ── [C-2+3/4-C2] C2: PAE download + domain detection (original logic) ──────
+    c2_afdb_ids_map = {}
+    c2_esm_rows_list = []
+    for row in c2_rows_raw:
+        aid = _A.get_afdb_id(row['sseqid'])
+        if aid:
+            c2_afdb_ids_map.setdefault(aid, []).append(row)
+        else:
+            c2_esm_rows_list.append(row)
+
+    all_c2_afdb_ids = set(c2_afdb_ids_map.keys())
+
+    _write_status(f'Downloading PAE/PDB and detecting domains for {len(c2_rows_raw)} C2 sequences...')
+    print(f'\n[C-2+3/4-C2] Downloading PAE+PDB and qualifying domains '
+          f'({len(c2_rows_raw)} sequences, threads={args.threads})...')
+
+    # Phase 2a: PAE
+    print('  [2a] Downloading PAE files (C2 only)...')
+    fetch_afdb_pae(all_c2_afdb_ids, pae_dir)
+
+    # Phase 2b: PDB
+    print('  [2b] Downloading PDB files (C2)...')
+    _B.stage_download(all_c2_afdb_ids, pdb_dir, args.threads)
+
+    with ThreadPoolExecutor(max_workers=args.threads) as ex:
+        for aid, poly in ex.map(_load_ref_poly, sorted(all_c2_afdb_ids)):
+            if poly is not None:
+                _ref_poly_cache[aid] = poly
+
+    if c2_esm_rows_list:
+        _resolve_esm_fragment_ids(c2_esm_rows_list)
+        print(f'  [2b-ESM] Fetching {len(c2_esm_rows_list)} ESM Atlas structure(s)...')
+        fetch_esm_structures(
+            [{'protein_hash': r.get('protein_hash') or r['sseqid'].split('|')[0],
+              'fragment_id':  r.get('fragment_id', -1),
+              'frag_row':     r.get('frag_row', -1)}
+             for r in c2_esm_rows_list],
+            pdb_dir, n_workers=args.threads, pae_dir=pae_dir,
+        )
+        seen_ph = set()
+        for row in c2_esm_rows_list:
+            ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
+            if ph in seen_ph or ph in _ref_poly_cache:
+                continue
+            seen_ph.add(ph)
+            src_pdb = esm_local_pdb(ph, pdb_dir)
+            if not os.path.exists(src_pdb):
+                continue
+            try:
+                st   = gemmi.read_structure(src_pdb)
+                poly = list(st[0][0])
+                _ref_poly_cache[ph] = poly
+            except Exception:
+                pass
+
+    # Phase 2c: Batch Rust PAE parse
     print('  [2c] Batch-parsing PAE matrices (Rust)...')
-    _SIZE_THRESH = 350_000  # bytes
+    _t2c = time.time()
+    _SIZE_THRESH = 350_000
     pae_paths_map = {aid: _pae_local_path(aid, pae_dir)
-                     for aid in all_afdb_ids
+                     for aid in all_c2_afdb_ids
                      if os.path.exists(_pae_local_path(aid, pae_dir))}
     pae_matrices_by_afdb = {}
     if pae_paths_map:
@@ -1613,7 +1986,6 @@ def main():
             small = {a: p for a, p in pae_paths_map.items() if os.path.getsize(p) < _SIZE_THRESH}
             large = {a: p for a, p in pae_paths_map.items() if os.path.getsize(p) >= _SIZE_THRESH}
             groups = [(2, small), (3, large)]
-
         for step, group in groups:
             if not group:
                 continue
@@ -1634,10 +2006,9 @@ def main():
                     except Exception:
                         pass
 
-    # Load ESM PAE npy files (written by _fetch_esm_pdbs_classB with pae_dir)
     n_esm_pae = 0
     seen_esm_ph = set()
-    for row in esm_rows_list:
+    for row in c2_esm_rows_list:
         ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
         if ph in seen_esm_ph or ph in pae_matrices_by_afdb:
             continue
@@ -1650,13 +2021,13 @@ def main():
                 n_esm_pae += 1
             except Exception:
                 pass
-    if esm_rows_list:
+    if c2_esm_rows_list:
         print(f'  ESM PAE loaded: {n_esm_pae}/{len(seen_esm_ph)} matrices')
+    print(f'  PAE parse: {time.time()-_t2c:.2f}s  ({len(pae_matrices_by_afdb)} matrices)')
+    _t2d = time.time()
 
-    # Phase 3: Threaded domain detection + qualification using pre-parsed matrices
+    # Phase 3: domain detection for C2
     def _qualify_esm_row(row):
-        """Qualify an ESM Atlas hit without PAE: use whole reference as one domain,
-        skip E-rejection (no PAE clustering to produce sub-domains), apply identity window."""
         ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
         ref_poly = _ref_poly_cache.get(ph)
         if ref_poly is None:
@@ -1664,10 +2035,10 @@ def main():
         domain = list(range(len(ref_poly)))
         if len(domain) < args.min_domain_size:
             return None, 'domain_too_small'
-        _, ops      = _B.parse_alignment_ops(row['qseq_alg'], row['sseq_alg'])
-        rp_to_comp  = _ref_pos_to_comp(row['qseq_alg'], row['sseq_alg'], row['alg_comp'])
-        domain_set  = set(domain)
-        d_ops       = _domain_ops(domain_set, ops)
+        _, ops     = _B.parse_alignment_ops(row['qseq_alg'], row['sseq_alg'])
+        rp_to_comp = _ref_pos_to_comp(row['qseq_alg'], row['sseq_alg'], row['alg_comp'])
+        domain_set = set(domain)
+        d_ops      = _domain_ops(domain_set, ops)
         if not d_ops:
             return None, 'no_domain'
         comp = _domain_comp_str(domain_set, d_ops, rp_to_comp)
@@ -1682,16 +2053,26 @@ def main():
         pae_res    = (args.pae_resolution_large
                       if n_full > args.large_domain_threshold
                       else args.pae_resolution)
-        domains    = get_domains_from_matrix(pae_matrix, n_full, step,
-                                             args.pae_power, args.pae_cutoff, pae_res)
-        if not domains:
+
+        # Try multiple PAE cutoffs and pick the domain maximising size × identity.
+        # Tighter cutoffs (smaller pae_cutoff) give more, smaller domains;
+        # looser cutoffs merge them. Trying both recovers large coherent domains
+        # that a single tight cutoff would fragment.
+        _PAE_CUTOFFS = sorted(set([args.pae_cutoff, 8.0, 12.0]))
+        all_qualifying = []
+        for cutoff in _PAE_CUTOFFS:
+            domains = get_domains_from_matrix(pae_matrix, n_full, step,
+                                              args.pae_power, cutoff, pae_res)
+            for d in domains:
+                if classify_domain(d, ops, ref_ss, rp_to_comp,
+                                   args.window_size, threshold_frac):
+                    matches = sum(1 for r in d if rp_to_comp.get(r) == '|')
+                    score   = len(d) * (matches / len(d) if d else 0)
+                    all_qualifying.append((score, d))
+
+        if not all_qualifying:
             return None, 'no_domain'
-        qualifying = [d for d in domains
-                      if classify_domain(d, ops, ref_ss, rp_to_comp,
-                                         args.window_size, threshold_frac)]
-        if not qualifying:
-            return None, 'no_domain'
-        best = max(qualifying, key=len)
+        best = max(all_qualifying, key=lambda x: x[0])[1]
         if len(best) < args.min_domain_size:
             return None, 'domain_too_small'
         plddt_vals = [ref_poly[pos].find_atom('CA', '\0').b_iso
@@ -1700,6 +2081,32 @@ def main():
         if plddt_vals and (sum(plddt_vals) / len(plddt_vals)) < args.min_domain_plddt:
             return None, 'domain_low_plddt'
         return {**row, '_best_domain': best}, 'ok'
+
+    def _qualify_with_sw_fallback(row, ref_poly, n_full, pae_matrix, step):
+        """Retry C2 qualification with SW alignment when NW gives no_domain."""
+        try:
+            r      = parasail.sw_trace_striped_16(
+                row['full_qseq'], row['full_sseq'], 10, 1, parasail.blosum45)
+            sw_qa  = r.traceback.query
+            sw_sa  = r.traceback.ref
+            sw_row = {**row, 'qseq_alg': sw_qa, 'sseq_alg': sw_sa,
+                      'alg_comp': r.traceback.comp.replace(' ', '-')}
+        except Exception:
+            return None, 'no_domain'
+        # Check C1 promotion first
+        pairs = [(q, s) for q, s in zip(sw_qa, sw_sa) if q != '-' and s != '-']
+        if pairs:
+            identity = sum(1 for q, s in pairs if q == s) / len(pairs)
+            coverage = len(pairs) / len(row['full_qseq'])
+            if coverage >= C1_COV_THRESH and identity >= threshold_frac:
+                result, status = _qualify_c1(sw_row)
+                if status == 'ok':
+                    result['_sw_rescue'] = True
+                return result, status
+        result, status = _qualify_row(sw_row, ref_poly, n_full, pae_matrix, step)
+        if status == 'ok' and result:
+            result['_sw_rescue'] = True
+        return result, status
 
     def _qualify_afdb(afdb_id, rows):
         if afdb_id is None:
@@ -1711,37 +2118,59 @@ def main():
         if pae_data is None:
             return [(None, 'no_pae')] * len(rows)
         n_full, pae_matrix, step = pae_data
-        return [_qualify_row(row, ref_poly, n_full, pae_matrix, step) for row in rows]
+        results = []
+        for row in rows:
+            result, status = _qualify_row(row, ref_poly, n_full, pae_matrix, step)
+            if status == 'no_domain':
+                result, status = _qualify_with_sw_fallback(
+                    row, ref_poly, n_full, pae_matrix, step)
+            results.append((result, status))
+        return results
 
-    qual_results = []
+    c2_qual_results = []
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
         futures = {ex.submit(_qualify_afdb, aid, rows): aid
-                   for aid, rows in rows_by_afdb.items()}
+                   for aid, rows in c2_afdb_ids_map.items()}
         for fut in as_completed(futures):
-            qual_results.extend(fut.result())
+            c2_qual_results.extend(fut.result())
 
-    # ESM Atlas rows: use PAE domain detection if available, else whole-structure fallback
     def _qualify_esm_dispatch(row):
-        ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
+        ph       = row.get('protein_hash') or row['sseqid'].split('|')[0]
         pae_data = pae_matrices_by_afdb.get(ph)
         if pae_data is not None:
             ref_poly = _ref_poly_cache.get(ph)
             if ref_poly is None:
                 return None, 'no_pdb'
             n_full, pae_matrix, step = pae_data
-            return _qualify_row(row, ref_poly, n_full, pae_matrix, step)
+            result, status = _qualify_row(row, ref_poly, n_full, pae_matrix, step)
+            if status == 'no_domain':
+                result, status = _qualify_with_sw_fallback(
+                    row, ref_poly, n_full, pae_matrix, step)
+            return result, status
         return _qualify_esm_row(row)
 
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
-        for result in ex.map(_qualify_esm_dispatch, esm_rows_list):
-            qual_results.append(result)
+        for result in ex.map(_qualify_esm_dispatch, c2_esm_rows_list):
+            c2_qual_results.append(result)
+
+    print(f'  Domain inference: {time.time()-_t2d:.2f}s  ({len(c2_qual_results)} C2 candidates)')
+
+    # ── Merge C1 + C2 qualifying results ──────────────────────────────────────
+    qual_results = c1_qual_results + c2_qual_results
 
     classC_rows = []
     n_qualify = n_no_pae = n_no_domain = n_too_small = n_low_plddt = n_no_pdb = 0
+    n_c1_ok = n_c2_ok = n_sw_rescue = 0
     for result_row, status in qual_results:
         if status == 'ok':
             classC_rows.append(result_row)
             n_qualify += 1
+            if result_row.get('_sw_rescue'):
+                n_sw_rescue += 1
+            if result_row.get('_c1'):
+                n_c1_ok += 1
+            else:
+                n_c2_ok += 1
         elif status == 'no_pae':
             n_no_pae += 1
         elif status == 'no_domain':
@@ -1753,7 +2182,7 @@ def main():
         elif status == 'no_pdb':
             n_no_pdb += 1
 
-    print(f'  Qualifying:         {n_qualify}')
+    print(f'  Qualifying:         {n_qualify}  (C1={n_c1_ok}, C2={n_c2_ok}, SW rescues={n_sw_rescue})')
     print(f'  No PAE file:        {n_no_pae}')
     print(f'  No domain:          {n_no_domain}')
     if n_too_small:
@@ -1763,10 +2192,13 @@ def main():
     if n_no_pdb:
         print(f'  No PDB (ESM):       {n_no_pdb}')
 
-    # Write candidate alignment table (all Class C candidates + outcome).
+    # Write candidate alignment table
     if args.write_candidates:
-        _status_map = {(result_row or {}).get('qseqid', ''): status
-                       for result_row, status in qual_results}
+        all_rows_for_status = list(merged.iter_rows(named=True))
+        _status_map = {}
+        for result_row, status in qual_results:
+            if result_row:
+                _status_map[result_row['qseqid']] = status
         cand_pq = os.path.join(indir, 'classC_candidates.pq')
         cand_df = merged.with_columns(
             pl.col('qseqid').replace(_status_map, default='skip').alias('classC_status')
@@ -1782,6 +2214,29 @@ def main():
     mode_label = f'complete ({backend_label})' if args.fill_missing else 'domain'
     _write_status(f'Building {len(classC_rows)} Class C structures...')
     print(f'\n[C-4/4] Building {len(classC_rows)} Class C {mode_label} structures...')
+
+    # Set up fragment kmer search globals (used by _frag_template_search inside build_complete_structure)
+    global _SEARCH_BIN, _AFDB_SIDX_PATH, _AFDB_PQ_PATH, _ESM_SIDX_PATH, _ESM_PQ_PATH, _FRAG_PDB_DIR
+    _FRAG_PDB_DIR = pdb_dir
+    _afdb_dir = os.environ.get('AT_AFDB_DIR', '')
+    if _afdb_dir:
+        _sidx = os.path.join(_afdb_dir, 'afdb_v6_reps.sidx')
+        _pq   = os.path.join(_afdb_dir, 'afdb_v6_reps.pq')
+        if os.path.exists(_sidx) and os.path.exists(_pq):
+            _sketch_cache = os.path.join(
+                os.path.expanduser('~'), '.cache', 'alphatracer', 'dayhoff_sketch', 'release')
+            _sb = os.path.join(_sketch_cache, 'search')
+            if os.path.exists(_sb):
+                _SEARCH_BIN     = _sb
+                _AFDB_SIDX_PATH = _sidx
+                _AFDB_PQ_PATH   = _pq
+    _esm_dir = os.environ.get('AT_ESM_DIR',
+                               str(os.path.join(os.path.expanduser('~'), 'Science', 'Data', 'ESMAtlas')))
+    _esm_sidx = os.path.join(_esm_dir, 'esm_plddt70_non-afdb_reps.sidx')
+    _esm_pq   = os.path.join(_esm_dir, 'esm_plddt70_non-afdb_reps.pq')
+    if _SEARCH_BIN and os.path.exists(_esm_sidx) and os.path.exists(_esm_pq):
+        _ESM_SIDX_PATH = _esm_sidx
+        _ESM_PQ_PATH   = _esm_pq
 
     if args.fill_missing:
         _write_status('Loading ESM2-3B + MiniFold model (Class C fill-missing)...')
@@ -1933,8 +2388,8 @@ def main():
         print(f'\nClass D: cannot find {filtered_fasta} — skipping.')
         return
 
-    from Bio import SeqIO as _SeqIO
-    all_seqs   = {r.id: str(r.seq) for r in _SeqIO.parse(filtered_fasta, 'fasta')}
+    from alphatracer.utils.structures_fetch import parse_fasta as _parse_fasta
+    all_seqs   = {r.id: r.seq for r in _parse_fasta(filtered_fasta)}
     classD_seqs = {sid: seq for sid, seq in all_seqs.items()
                    if sid not in covered_ids}
 

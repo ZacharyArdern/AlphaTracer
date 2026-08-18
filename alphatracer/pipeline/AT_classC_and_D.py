@@ -79,8 +79,8 @@ _PKG_PARENT  = os.path.dirname(_HERE)                        # repo root
 if _PKG_PARENT not in sys.path:
     sys.path.insert(0, _PKG_PARENT)
 
-from alphatracer import AT_classA as _A
-from alphatracer import AT_classB as _B
+from alphatracer.pipeline import AT_classA as _A
+from alphatracer.pipeline import AT_classB as _B
 from alphatracer.utils.pae_to_domains import (parse_pae_file, domains_from_pae_matrix_igraph,
                                                parse_pae_batch_rust, domains_from_pae_subsampled)
 from alphatracer.utils.structures_fetch import (

@@ -744,14 +744,22 @@ def esm_local_pdb(protein_hash: str, pdb_dir: str) -> str:
 
 
 def fetch_esm_structures(esm_rows, pdb_dir: str, n_workers: int = 8,
-                          pae_dir: str | None = None) -> None:
+                          pae_dir: str | None = None,
+                          frag_cache_dir: str | None = None) -> None:
     """
     Fetch ESM Atlas PDB structures and optionally PAE matrices.
 
-    esm_rows: iterable of dicts with keys protein_hash, and optionally
-              fragment_id and frag_row.
-    pae_dir:  if given, PAE matrices are fetched simultaneously.
+    esm_rows:       iterable of dicts with keys protein_hash, and optionally
+                    fragment_id and frag_row.
+    pae_dir:        if given, PAE matrices are fetched simultaneously.
+    frag_cache_dir: override _FRAG_CACHE_DIR (directory with .npz offset caches
+                    and frag_paths.json). Defaults to the AT_FRAG_CACHE_DIR env
+                    var or AT_ESM_DIR/esm_atlas_fragment_cache/.
     """
+    global _FRAG_CACHE_DIR, _FRAG_PATHS_FILE
+    if frag_cache_dir is not None:
+        _FRAG_CACHE_DIR = Path(frag_cache_dir)
+        _FRAG_PATHS_FILE = _FRAG_CACHE_DIR / 'frag_paths.json'
     fetch_pae = pae_dir is not None
     hits, need_lookup, seen = [], [], set()
     hits_with_coords = []

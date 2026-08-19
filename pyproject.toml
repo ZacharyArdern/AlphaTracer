@@ -63,6 +63,7 @@ all = ["alphatracer[mlx,cuda,sketch]"]
 
 [project.scripts]
 alphatracer = "alphatracer.run_alphatracer:main"
+simple_fetch = "alphatracer.scripts.simple_fetch:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

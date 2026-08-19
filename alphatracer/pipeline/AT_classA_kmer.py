@@ -29,7 +29,6 @@ import aiohttp
 import polars as pl
 import parasail
 import gemmi
-import duckdb
 from alphatracer.utils.afdb_fetch import (
     AFDB_VERSION, get_afdb_id, afdb_local_pdb, is_valid_pdb,
     fetch_afdb_pdbs, parse_fasta,
@@ -447,14 +446,11 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
         if is_row_idx:
             missing_idx = [int(t) for t in missing]
             if _HAS_SEQ_IDX:
-                # DuckDB with seq_idx integer column: min/max statistics allow row-group
-                # skipping in C++, faster than Python-level row-group reads.
-                db_rows = duckdb.connect().execute(
-                    f"SELECT seq_idx, {id_col}, sequence FROM read_parquet('{REPS_PQ}')"
-                    f" WHERE seq_idx IN (SELECT unnest(?))",
-                    [missing_idx]
-                ).fetchall()
-                for seq_idx_val, afdb_id_val, seq in db_rows:
+                df = (pl.scan_parquet(REPS_PQ)
+                        .filter(pl.col('seq_idx').is_in(missing_idx))
+                        .select(['seq_idx', id_col, 'sequence'])
+                        .collect())
+                for seq_idx_val, afdb_id_val, seq in df.iter_rows():
                     ann_pkl[str(seq_idx_val)] = (afdb_id_val or "", "", 0, 0, seq)
             else:
                 # Fallback: pyarrow row-group reads (fast for small batches).
@@ -506,11 +502,11 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
         stale = [int(t) for t in targets if t in ann_pkl and not ann_pkl[t][0]]
         if stale:
             if _HAS_SEQ_IDX:
-                stale_db = duckdb.connect().execute(
-                    f"SELECT seq_idx, {id_col_local} FROM read_parquet('{REPS_PQ}')"
-                    f" WHERE seq_idx IN (SELECT unnest(?))", [stale]
-                ).fetchall()
-                for row_idx_int, afdb_id_val in stale_db:
+                df = (pl.scan_parquet(REPS_PQ)
+                        .filter(pl.col('seq_idx').is_in(stale))
+                        .select(['seq_idx', id_col_local])
+                        .collect())
+                for row_idx_int, afdb_id_val in df.iter_rows():
                     existing = ann_pkl[str(row_idx_int)]
                     ann_pkl[str(row_idx_int)] = (afdb_id_val or "",) + existing[1:]
             else:

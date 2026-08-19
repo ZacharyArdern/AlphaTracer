@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use crate::{build_alphabet, load_index, read_fasta, run_search, sketch};
-use crate::utils::parse_pae;
+use crate::parse_pae;
 use crate::build_index as lib_build_index;
 
 #[pyfunction]

@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-pub mod utils;
+pub mod parse_pae;
 
 #[cfg(feature = "extension-module")]
 use pyo3::prelude::*;

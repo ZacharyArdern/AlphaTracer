@@ -3,6 +3,9 @@
 # Fetch PDB structures from AlphaFold DB and/or ESM Atlas given DIAMOND BLAST hits.
 # Author: Zachary Ardern <z.ardern@gmail.com>
 #
+# Requires AlphaTracer to be installed:
+#   pip install -e /path/to/AlphaTracer
+#
 # ── Mode 1: run DIAMOND then fetch (default) ──────────────────────────────────
 #   simple_fetch.py -q query.fasta -d afdb.dmnd esm.dmnd -o hits \
 #       --id 50 --qcov 80 --targets 1 --outdir pdb_hits/
@@ -19,23 +22,19 @@
 #       --pident 30 --qcov 50 --targets 1 --outdir pdb_hits/
 
 import argparse
-import asyncio
 import os
-import re
 import subprocess
 import sys
-import time
-import urllib.request
-from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from collections import defaultdict
 
 try:
-    import aiohttp as _aiohttp
-    _HAS_AIOHTTP = True
+    from alphatracer.utils.afdb_fetch import get_afdb_id, fetch_afdb_pdbs
+    from alphatracer.utils.esm_atlas_fetch import fetch_esm_structures
 except ImportError:
-    _aiohttp = None
-    _HAS_AIOHTTP = False
+    sys.exit(
+        'Error: AlphaTracer is not installed.\n'
+        'Run: pip install -e /path/to/AlphaTracer'
+    )
 
 VERSION = "0.1"
 
@@ -54,48 +53,9 @@ DEFAULT_FMT = (
     "qstart qend sstart send evalue bitscore"
 ).split()
 
-# ── AFDB / ESM helpers ────────────────────────────────────────────────────────
-
-AFDB_VERSION = 6
-_ESM_DIR = os.environ.get('AT_ESM_DIR', str(Path.home() / 'Science/Data/ESMAtlas'))
-
-
-def get_afdb_id(sseqid: str) -> str | None:
-    """Extract bare AF-XXXX-F1 accession from a DIAMOND sseqid (strips version suffix)."""
-    if sseqid.startswith('AF-'):
-        acc = sseqid
-    elif ':' in sseqid:
-        acc = sseqid.split(':')[1]
-        if not acc.startswith('AF-'):
-            return None
-    else:
-        return None
-    return re.sub(r'-model_v\d+$', '', acc)
-
 
 def is_afdb_sseqid(sseqid: str) -> bool:
     return bool(get_afdb_id(sseqid))
-
-
-def afdb_url(afdb_id: str) -> str:
-    return f'https://alphafold.ebi.ac.uk/files/{afdb_id}-model_v{AFDB_VERSION}.pdb'
-
-
-def afdb_local_pdb(afdb_id: str, pdb_dir: str) -> str:
-    return os.path.join(pdb_dir, f'{afdb_id}-model_v{AFDB_VERSION}.pdb')
-
-
-def esm_local_pdb(protein_hash: str, pdb_dir: str) -> str:
-    return os.path.join(pdb_dir, f'esm_{protein_hash}.pdb')
-
-
-def is_valid_pdb(path: str) -> bool:
-    try:
-        with open(path, 'rb') as f:
-            header = f.read(6).decode('ascii', errors='ignore')
-        return header.strip()[:6] in ('HEADER', 'REMARK', 'ATOM  ', 'MODEL ')
-    except Exception:
-        return False
 
 
 def infer_db_tag(hits_path: str) -> str:
@@ -131,159 +91,6 @@ def run_diamond(query: str, db: str, output: str,
     ]
     print(f'  Running: {" ".join(cmd)}', flush=True)
     subprocess.run(cmd, check=True)
-
-
-# ── AFDB fetch ────────────────────────────────────────────────────────────────
-
-async def _fetch_afdb_pdbs_async(afdb_ids, pdb_dir: str) -> dict:
-    sem = asyncio.Semaphore(64)
-    connector = _aiohttp.TCPConnector(limit=64)
-
-    async def _fetch_one(session, aid):
-        path = afdb_local_pdb(aid, pdb_dir)
-        if os.path.exists(path) and is_valid_pdb(path):
-            return aid, f'exists:{os.path.basename(path)}'
-        async with sem:
-            try:
-                async with session.get(afdb_url(aid)) as resp:
-                    data = await resp.read()
-                with open(path, 'wb') as f:
-                    f.write(data)
-                if is_valid_pdb(path):
-                    return aid, f'downloaded:{os.path.basename(path)}'
-                os.remove(path)
-                return aid, f'failed:{aid}:server returned non-PDB content'
-            except Exception as e:
-                if os.path.exists(path):
-                    os.remove(path)
-                return aid, f'failed:{aid}:{e}'
-
-    async with _aiohttp.ClientSession(connector=connector) as session:
-        return dict(await asyncio.gather(*[_fetch_one(session, aid) for aid in afdb_ids]))
-
-
-def _fetch_afdb_pdbs_threaded(afdb_ids, pdb_dir: str) -> dict:
-    def _fetch_one(aid):
-        path = afdb_local_pdb(aid, pdb_dir)
-        if os.path.exists(path) and is_valid_pdb(path):
-            return aid, f'exists:{os.path.basename(path)}'
-        try:
-            with urllib.request.urlopen(afdb_url(aid)) as resp:
-                data = resp.read()
-            with open(path, 'wb') as f:
-                f.write(data)
-            if is_valid_pdb(path):
-                return aid, f'downloaded:{os.path.basename(path)}'
-            os.remove(path)
-            return aid, f'failed:{aid}:server returned non-PDB content'
-        except Exception as e:
-            if os.path.exists(path):
-                os.remove(path)
-            return aid, f'failed:{aid}:{e}'
-
-    with ThreadPoolExecutor(max_workers=32) as ex:
-        return dict(ex.map(_fetch_one, afdb_ids))
-
-
-def _fetch_afdb_once(ids, pdb_dir):
-    if _HAS_AIOHTTP:
-        return asyncio.run(_fetch_afdb_pdbs_async(ids, pdb_dir))
-    return _fetch_afdb_pdbs_threaded(ids, pdb_dir)
-
-
-def fetch_afdb_pdbs(afdb_ids, pdb_dir: str) -> dict:
-    os.makedirs(pdb_dir, exist_ok=True)
-    ids = list(afdb_ids)
-    if not _HAS_AIOHTTP:
-        print('  [INFO] aiohttp not found; using urllib fallback (32 threads)')
-    results = _fetch_afdb_once(ids, pdb_dir)
-    retry = [aid for aid, r in results.items() if r.startswith('fail')]
-    if retry:
-        print(f'  Retrying {len(retry)} failed download(s)...')
-        results.update(_fetch_afdb_once(retry, pdb_dir))
-    summary = Counter(r.split(':')[0] for r in results.values())
-    for r in results.values():
-        if r.startswith('fail'):
-            print(f'  FAILED: {r}')
-    print(f"  Downloaded: {summary['downloaded']}  "
-          f"Already present: {summary['exists']}  "
-          f"Failed: {summary.get('failed', 0) + summary.get('fail', 0)}")
-    return results
-
-
-# ── ESM Atlas fetch ───────────────────────────────────────────────────────────
-
-def fetch_esm_structures(esm_rows, pdb_dir: str, n_workers: int = 8) -> None:
-    esm_dir = os.path.abspath(_ESM_DIR)
-    if esm_dir not in sys.path:
-        sys.path.insert(0, esm_dir)
-    try:
-        import esm_query as _esm
-    except ImportError:
-        print(f'  [WARN] Cannot import esm_query from {esm_dir} — ESM Atlas hits skipped')
-        return
-
-    hits, need_lookup, seen = [], [], set()
-    for row in esm_rows:
-        ph  = row.get('protein_hash') or ''
-        fid = row.get('fragment_id', -1)
-        fr  = row.get('frag_row', -1)
-        if not ph or ph in seen:
-            continue
-        seen.add(ph)
-        if os.path.exists(esm_local_pdb(ph, pdb_dir)):
-            continue
-        if fid is not None and fid >= 0 and fr is not None and fr >= 0:
-            hits.append({'fragment_id': fid, 'frag_row': fr, 'protein_hash': ph})
-        else:
-            need_lookup.append(ph)
-
-    if need_lookup:
-        print(f'  Resolving {len(need_lookup)} ESM protein_hash(es) via local index...',
-              flush=True)
-        try:
-            idx = _esm.lookup_hashes(need_lookup)
-            lookup_map = {r['protein_hash']: (r['fragment_id'], r['frag_row'])
-                          for r in idx.iter_rows(named=True)}
-            for ph in need_lookup:
-                coords = lookup_map.get(ph)
-                if coords and coords[0] >= 0:
-                    hits.append({'fragment_id': int(coords[0]),
-                                 'frag_row': int(coords[1]),
-                                 'protein_hash': ph})
-                else:
-                    print(f'  [WARN] No index entry for ESM protein_hash {ph} — skipping')
-        except Exception as e:
-            print(f'  [WARN] ESM lookup_hashes failed: {e}')
-
-    if not hits:
-        return
-
-    print(f'  Fetching {len(hits)} ESM Atlas PDB(s) from S3...', flush=True)
-    t0 = time.time()
-    try:
-        pdb_table = _esm.query_from_hits(hits,
-                                         columns=['protein_hash', 'structure_blob'],
-                                         n_workers=n_workers)
-    except Exception as e:
-        print(f'  [WARN] ESM Atlas fetch failed: {type(e).__name__}: {e}')
-        return
-
-    n_pdb = 0
-    if pdb_table is not None:
-        for ph, blob in zip(pdb_table['protein_hash'].to_list(),
-                            pdb_table['structure_blob'].to_list()):
-                if blob is None:
-                    continue
-                try:
-                    with open(esm_local_pdb(ph, pdb_dir), 'w') as f:
-                        f.write(_esm.blob_to_pdb(blob))
-                    n_pdb += 1
-                except Exception as e:
-                    print(f'  [WARN] ESM decode failed for {ph}: {e}')
-
-    print(f'  Fetched {n_pdb}/{len(hits)} ESM structures in {time.time()-t0:.1f}s',
-          flush=True)
 
 
 # ── Hit parsing and selection ─────────────────────────────────────────────────

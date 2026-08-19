@@ -25,10 +25,17 @@ import re
 import subprocess
 import sys
 import time
+import urllib.request
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import aiohttp
+try:
+    import aiohttp as _aiohttp
+    _HAS_AIOHTTP = True
+except ImportError:
+    _aiohttp = None
+    _HAS_AIOHTTP = False
 
 VERSION = "0.1"
 
@@ -130,16 +137,15 @@ def run_diamond(query: str, db: str, output: str,
 
 async def _fetch_afdb_pdbs_async(afdb_ids, pdb_dir: str) -> dict:
     sem = asyncio.Semaphore(64)
-    connector = aiohttp.TCPConnector(limit=64)
+    connector = _aiohttp.TCPConnector(limit=64)
 
     async def _fetch_one(session, aid):
         path = afdb_local_pdb(aid, pdb_dir)
         if os.path.exists(path) and is_valid_pdb(path):
             return aid, f'exists:{os.path.basename(path)}'
-        url = afdb_url(aid)
         async with sem:
             try:
-                async with session.get(url) as resp:
+                async with session.get(afdb_url(aid)) as resp:
                     data = await resp.read()
                 with open(path, 'wb') as f:
                     f.write(data)
@@ -152,18 +158,49 @@ async def _fetch_afdb_pdbs_async(afdb_ids, pdb_dir: str) -> dict:
                     os.remove(path)
                 return aid, f'failed:{aid}:{e}'
 
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with _aiohttp.ClientSession(connector=connector) as session:
         return dict(await asyncio.gather(*[_fetch_one(session, aid) for aid in afdb_ids]))
+
+
+def _fetch_afdb_pdbs_threaded(afdb_ids, pdb_dir: str) -> dict:
+    def _fetch_one(aid):
+        path = afdb_local_pdb(aid, pdb_dir)
+        if os.path.exists(path) and is_valid_pdb(path):
+            return aid, f'exists:{os.path.basename(path)}'
+        try:
+            with urllib.request.urlopen(afdb_url(aid)) as resp:
+                data = resp.read()
+            with open(path, 'wb') as f:
+                f.write(data)
+            if is_valid_pdb(path):
+                return aid, f'downloaded:{os.path.basename(path)}'
+            os.remove(path)
+            return aid, f'failed:{aid}:server returned non-PDB content'
+        except Exception as e:
+            if os.path.exists(path):
+                os.remove(path)
+            return aid, f'failed:{aid}:{e}'
+
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        return dict(ex.map(_fetch_one, afdb_ids))
+
+
+def _fetch_afdb_once(ids, pdb_dir):
+    if _HAS_AIOHTTP:
+        return asyncio.run(_fetch_afdb_pdbs_async(ids, pdb_dir))
+    return _fetch_afdb_pdbs_threaded(ids, pdb_dir)
 
 
 def fetch_afdb_pdbs(afdb_ids, pdb_dir: str) -> dict:
     os.makedirs(pdb_dir, exist_ok=True)
     ids = list(afdb_ids)
-    results = asyncio.run(_fetch_afdb_pdbs_async(ids, pdb_dir))
+    if not _HAS_AIOHTTP:
+        print('  [INFO] aiohttp not found; using urllib fallback (32 threads)')
+    results = _fetch_afdb_once(ids, pdb_dir)
     retry = [aid for aid, r in results.items() if r.startswith('fail')]
     if retry:
         print(f'  Retrying {len(retry)} failed download(s)...')
-        results.update(asyncio.run(_fetch_afdb_pdbs_async(retry, pdb_dir)))
+        results.update(_fetch_afdb_once(retry, pdb_dir))
     summary = Counter(r.split(':')[0] for r in results.values())
     for r in results.values():
         if r.startswith('fail'):
@@ -207,9 +244,7 @@ def fetch_esm_structures(esm_rows, pdb_dir: str, n_workers: int = 8) -> None:
         try:
             idx = _esm.lookup_hashes(need_lookup)
             lookup_map = {r['protein_hash']: (r['fragment_id'], r['frag_row'])
-                          for r in [dict(zip(idx.schema.names, row))
-                                    for row in zip(*[idx.column(c).to_pylist()
-                                                     for c in idx.schema.names])]}
+                          for r in idx.iter_rows(named=True)}
             for ph in need_lookup:
                 coords = lookup_map.get(ph)
                 if coords and coords[0] >= 0:
@@ -236,9 +271,8 @@ def fetch_esm_structures(esm_rows, pdb_dir: str, n_workers: int = 8) -> None:
 
     n_pdb = 0
     if pdb_table is not None:
-        for batch in pdb_table.to_batches():
-            for ph, blob in zip(batch['protein_hash'].to_pylist(),
-                                batch['structure_blob'].to_pylist()):
+        for ph, blob in zip(pdb_table['protein_hash'].to_list(),
+                            pdb_table['structure_blob'].to_list()):
                 if blob is None:
                     continue
                 try:

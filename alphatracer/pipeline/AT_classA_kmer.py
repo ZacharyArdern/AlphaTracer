@@ -467,34 +467,24 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
             print(f"  Row-idx fetch ({'seq_idx' if _HAS_SEQ_IDX else 'row-group'}): "
                   f"{len(missing_idx)} rows in {time.time()-t_ann:.1f}s", flush=True)
         else:
-            con = duckdb.connect()
             if _HAS_DB_TYPE:
-                db_rows = con.execute(f"""
-                    SELECT {id_col}, db_type, afdb_id, protein_hash, fragment_id, frag_row,
-                           function, family, group_size, n_reps, sequence
-                    FROM read_parquet('{REPS_PQ}')
-                    WHERE {id_col} IN ?
-                """, [list(missing)]).fetchall()
-                for row in db_rows:
-                    ann_pkl[row[0]] = row[1:]
+                cols = [id_col, 'db_type', 'afdb_id', 'protein_hash',
+                        'fragment_id', 'frag_row', 'function', 'family',
+                        'group_size', 'n_reps', 'sequence']
             elif _HAS_ANN:
-                db_rows = con.execute(f"""
-                    SELECT {id_col}, function, family, group_size, n_reps, sequence
-                    FROM read_parquet('{REPS_PQ}')
-                    WHERE {id_col} IN ?
-                """, [list(missing)]).fetchall()
-                for row in db_rows:
-                    ann_pkl[row[0]] = row[1:]
+                cols = [id_col, 'function', 'family', 'group_size', 'n_reps', 'sequence']
             else:
-                db_rows = con.execute(f"""
-                    SELECT {id_col}, sequence
-                    FROM read_parquet('{REPS_PQ}')
-                    WHERE {id_col} IN ?
-                """, [list(missing)]).fetchall()
-                for row in db_rows:
+                cols = [id_col, 'sequence']
+            df = (pl.scan_parquet(REPS_PQ)
+                    .filter(pl.col(id_col).is_in(list(missing)))
+                    .select(cols)
+                    .collect())
+            for row in df.iter_rows():
+                if _HAS_DB_TYPE or _HAS_ANN:
+                    ann_pkl[row[0]] = row[1:]
+                else:
                     ann_pkl[row[0]] = ("", "", 0, 0, row[1])
-            con.close()
-            print(f"  DuckDB query: {len(missing)} new targets in {time.time()-t_ann:.1f}s  "
+            print(f"  Polars query: {len(missing)} new targets in {time.time()-t_ann:.1f}s  "
                   f"(cache now {len(ann_pkl):,} entries)", flush=True)
         _save_ann_cache(ann_pkl)
 

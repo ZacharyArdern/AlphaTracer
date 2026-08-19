@@ -45,8 +45,10 @@ except ImportError:
     except ImportError:
         sys.exit(
             'Error: could not import afdb_fetch / esm_atlas_fetch.\n'
-            'Either install AlphaTracer (pip install -e /path/to/AlphaTracer)\n'
-            'or run this script from the AlphaTracer repo directory.'
+            'Options:\n'
+            '  1. Install AlphaTracer:  pip install -e /path/to/AlphaTracer\n'
+            '  2. Run from the AlphaTracer repo directory\n'
+            '  3. Copy afdb_fetch.py and esm_atlas_fetch.py to the current directory'
         )
 
 VERSION = "0.1"

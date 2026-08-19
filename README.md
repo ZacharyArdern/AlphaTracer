@@ -91,11 +91,19 @@ Key options:
 | `--no-classD` | — | Skip de novo prediction entirely |
 | `--verbose` | — | Full output instead of progress bar |
 
+**Alternative script:** simply obtain the best-hit PDB structure for query sequences:
+
+```bash
+simple_fetch.py -q input.fa -d ./AT_Data/
+```
+
+See the [simple_fetch.py wiki page](https://github.com/ZacharyArdern/AlphaTracer/wiki/simple_fetch) for full documentation.
+
 ---
 
 ## Dependencies
 
-Core: `polars`, `pyarrow`, `duckdb`, `biopython`, `parasail`, `gemmi`, `pycurl`, `numpy`, `scipy`, `igraph`, `openmm`
+Core: `polars`, `numpy`, `scipy`, `parasail`, `gemmi`, `igraph`, `openmm`, `aiohttp`
 
 Backend-specific: `mlx` + `minifold-mlx` (Apple Silicon) or `torch` + `fair-esm` (Linux/cloud)
 

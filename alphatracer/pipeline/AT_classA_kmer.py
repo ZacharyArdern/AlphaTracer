@@ -44,6 +44,13 @@ except ImportError:
 def _tqdm(it, **kw):
     return tqdm(it, **kw) if HAS_TQDM else it
 
+try:
+    import alphatracer_sketch as _rs
+    _HAS_RS = True
+except ImportError:
+    _rs = None
+    _HAS_RS = False
+
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 
@@ -292,6 +299,9 @@ def _save_ann_cache(cache: dict) -> None:
 # ── Stage 2: kmer sketch search ────────────────────────────────────────────────
 
 def _ensure_binaries():
+    if _HAS_RS:
+        # Native PyO3 extension available — no binaries needed.
+        return None, None
     index_seqs = os.path.join(_SKETCH_RS_BIN, "index-seqs")
     search     = os.path.join(_SKETCH_RS_BIN, "search")
     if os.path.exists(index_seqs) and os.path.exists(search):
@@ -317,6 +327,8 @@ def _build_sidx(index_seqs_bin):
     The index-seqs binary requires the ID column to be named 'AFDB_ID' or 'rep_AFDB_ID'.
     If the source parquet uses a different name (e.g. 'header' for ESMAtlas), a renamed
     temp parquet is streamed first, then cleaned up after indexing.
+
+    When alphatracer_sketch is installed, uses the native build_index() API directly.
     """
     global _ID_COL
     n = pl.scan_parquet(REPS_PQ).select(pl.len()).collect().item()
@@ -337,10 +349,13 @@ def _build_sidx(index_seqs_bin):
         src_pq = tmp_pq
 
     try:
-        r = subprocess.run([index_seqs_bin, src_pq, SIDX_CACHE,
-                            str(K), str(MAX_FREQ), "100"])
-        if r.returncode != 0:
-            print("index-seqs binary failed"); sys.exit(1)
+        if _HAS_RS:
+            _rs.build_index([src_pq], SIDX_CACHE, K, MAX_FREQ, 100)
+        else:
+            r = subprocess.run([index_seqs_bin, src_pq, SIDX_CACHE,
+                                str(K), str(MAX_FREQ), "100"])
+            if r.returncode != 0:
+                print("index-seqs binary failed"); sys.exit(1)
     finally:
         if tmp_pq and os.path.exists(tmp_pq):
             os.remove(tmp_pq)
@@ -385,36 +400,66 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
 
     print(f"  Running Rust search (top_k={top_k})...", flush=True)
     t0 = time.time()
-    proc = subprocess.Popen(
-        [search_bin, SIDX_CACHE, filtered_fasta,
-         str(top_k), str(MIN_SHARED), str(K), str(N_HASH_SEARCH)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-    )
-    # Stream stderr live (progress bar) while collecting stdout
-    stdout_lines = []
-    def _drain_stderr():
-        for line in proc.stderr:
-            sys.stderr.write(line)
-            sys.stderr.flush()
-    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-    stderr_thread.start()
-    stdout_lines = proc.stdout.read().splitlines()
-    proc.wait()
-    stderr_thread.join()
-    if proc.returncode != 0:
-        sys.exit(1)
-    lines = stdout_lines
-    header   = lines[0] if lines else ""
-    raw_hits = lines[1:] if lines else []
-    is_row_idx = "row_idx" in header  # v3 sidx: targets are parquet row indices
-    print(f"  {len(raw_hits)} hits in {time.time()-t0:.1f}s", flush=True)
 
     _extra_schema = {
         'db_type': pl.String, 'afdb_id': pl.String,
         'protein_hash': pl.String, 'fragment_id': pl.Int32, 'frag_row': pl.Int32,
     } if (_HAS_DB_TYPE or _IS_STANDALONE_ESM) else {}
 
-    if not raw_hits:
+    if _HAS_RS:
+        # Use native PyO3 extension — no subprocess needed.
+        raw_results = _rs.search_fasta(SIDX_CACHE, filtered_fasta, top_k, MIN_SHARED, N_HASH_SEARCH)
+        # raw_results: list of (query_id, seq_idx_u32, shared_u32, jaccard_f64)
+        parsed = [(q, str(s), sh, j) for q, s, sh, j in raw_results]
+        targets = {str(s) for _, s, _, _ in raw_results}
+        is_row_idx = True  # recoded_sketch always returns row indices
+        print(f"  {len(parsed)} hits in {time.time()-t0:.1f}s", flush=True)
+    else:
+        proc = subprocess.Popen(
+            [search_bin, SIDX_CACHE, filtered_fasta,
+             str(top_k), str(MIN_SHARED), str(K), str(N_HASH_SEARCH)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        # Stream stderr live (progress bar) while collecting stdout
+        stdout_lines = []
+        def _drain_stderr():
+            for line in proc.stderr:
+                sys.stderr.write(line)
+                sys.stderr.flush()
+        stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        stderr_thread.start()
+        stdout_lines = proc.stdout.read().splitlines()
+        proc.wait()
+        stderr_thread.join()
+        if proc.returncode != 0:
+            sys.exit(1)
+        lines = stdout_lines
+        header   = lines[0] if lines else ""
+        raw_hits = lines[1:] if lines else []
+        is_row_idx = "row_idx" in header  # v3 sidx: targets are parquet row indices
+        print(f"  {len(raw_hits)} hits in {time.time()-t0:.1f}s", flush=True)
+
+        if not raw_hits:
+            return pl.DataFrame(schema={
+                'containment_value': pl.Float64, 'sseqid': pl.String, 'qseqid': pl.String,
+                'evalue': pl.Float64, 'slen': pl.Int32, 'qlen': pl.Int32,
+                'full_qseq': pl.String, 'full_sseq': pl.String,
+                'function': pl.String, 'family': pl.String,
+                'group_size': pl.Int32, 'n_reps': pl.Int32,
+                **_extra_schema,
+            })
+
+        parsed = []
+        targets = set()
+        for line in raw_hits:
+            parts = line.split("\t")
+            if len(parts) < 4:
+                continue
+            query, target, shared, containment_value = parts[0], parts[1], int(parts[2]), float(parts[3])
+            parsed.append((query, target, shared, containment_value))
+            targets.add(target)
+
+    if not parsed:
         return pl.DataFrame(schema={
             'containment_value': pl.Float64, 'sseqid': pl.String, 'qseqid': pl.String,
             'evalue': pl.Float64, 'slen': pl.Int32, 'qlen': pl.Int32,
@@ -423,16 +468,6 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
             'group_size': pl.Int32, 'n_reps': pl.Int32,
             **_extra_schema,
         })
-
-    parsed = []
-    targets = set()
-    for line in raw_hits:
-        parts = line.split("\t")
-        if len(parts) < 4:
-            continue
-        query, target, shared, containment_value = parts[0], parts[1], int(parts[2]), float(parts[3])
-        parsed.append((query, target, shared, containment_value))
-        targets.add(target)
 
     # ── Progressive annotation cache ──────────────────────────────────────────
     # Load what we already know; fetch only genuinely new targets.

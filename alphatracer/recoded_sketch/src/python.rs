@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::{build_alphabet, load_index, read_fasta, run_search, sketch};
 use crate::utils::parse_pae;
+use crate::build_index as lib_build_index;
 
 #[pyfunction]
 #[pyo3(signature = (sidx_path, fasta_path, top_k=5, min_shared=2, n_hash_search=0))]
@@ -67,8 +68,27 @@ pub fn parse_pae_batch(
     }).collect())
 }
 
+#[pyfunction]
+#[pyo3(signature = (seq_pqs, out_path, k=11usize, max_freq=0.001f64, n_hash=64usize, scheme="murphy2000_5"))]
+pub fn build_index(
+    py: Python<'_>,
+    seq_pqs: Vec<String>,
+    out_path: String,
+    k: usize,
+    max_freq: f64,
+    n_hash: usize,
+    scheme: &str,
+) -> PyResult<usize> {
+    let scheme = scheme.to_string();
+    py.allow_threads(move || {
+        lib_build_index(&seq_pqs, &out_path, k, max_freq, n_hash, &scheme)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e))
+    })
+}
+
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(search_fasta, m)?)?;
     m.add_function(wrap_pyfunction!(parse_pae_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(build_index, m)?)?;
     Ok(())
 }

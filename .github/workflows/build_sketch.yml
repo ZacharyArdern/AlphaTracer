@@ -1,0 +1,33 @@
+name: Build recoded_sketch wheels
+
+on:
+  push:
+    paths:
+      - 'alphatracer/recoded_sketch/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: alphatracer/recoded_sketch
+          command: build
+          args: --release --out dist
+          target: ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: alphatracer/recoded_sketch/dist/

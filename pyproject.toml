@@ -54,8 +54,12 @@ cpu = [
 # it is not pip-installable. See https://openstructure.org/promod3/
 promod3 = []
 
-# Everything pip-installable (mlx + cuda; excludes promod3 and non-PyPI packages)
-all = ["alphatracer[mlx,cuda]"]
+sketch = [
+    "alphatracer-sketch>=0.1.0",
+]
+
+# Everything pip-installable (mlx + cuda + sketch; excludes promod3 and non-PyPI packages)
+all = ["alphatracer[mlx,cuda,sketch]"]
 
 [project.scripts]
 alphatracer = "alphatracer.run_alphatracer:main"

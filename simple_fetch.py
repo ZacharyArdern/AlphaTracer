@@ -3,8 +3,13 @@
 # Fetch PDB structures from AlphaFold DB and/or ESM Atlas given DIAMOND BLAST hits.
 # Author: Zachary Ardern <z.ardern@gmail.com>
 #
+# Generate DIAMOND hits (run before this script):
+#   diamond blastp -q query.fasta -d afdb.dmnd -o afdb_hits.tsv \
+#       --outfmt 6 qseqid sseqid pident qcovhsp bitscore \
+#       --max-target-seqs 5 --threads 8
+#
 # Usage:
-#   simple_fetch.py --afdb_hits afdb.tsv --esm_hits esm.tsv \
+#   simple_fetch.py --afdb_hits afdb_hits.tsv --esm_hits esm_hits.tsv \
 #       --fmt qseqid sseqid pident qcovhsp bitscore \
 #       --pident 30 --qcov 50 --targets 1 --outdir pdb_hits/
 

@@ -56,7 +56,7 @@ ANN_CACHE  = os.path.join(AFDB_DIR, "afdb_v6_reps_ann_cache.pkl")  # progressive
 _ID_COL            = None   # name of the ID column in REPS_PQ
 _HAS_ANN           = True   # False for DBs without function/family/group_size/n_reps columns
 _HAS_DB_TYPE       = False  # True for merged AFDB+ESMAtlas DBs with db_type column; auto-detected
-_HAS_SEQ_IDX       = False  # True when parquet has seq_idx integer column (enables DuckDB min/max pruning)
+_HAS_SEQ_IDX       = False  # True when parquet has seq_idx integer column (enables polars integer is_in filter)
 _IS_STANDALONE_ESM = False  # True for standalone ESMAtlas DBs (header+sequence only, no db_type col)
 
 # _ESM_DIR imported from alphatracer.utils.esm_atlas_fetch
@@ -453,7 +453,7 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
                 for seq_idx_val, afdb_id_val, seq in df.iter_rows():
                     ann_pkl[str(seq_idx_val)] = (afdb_id_val or "", "", 0, 0, seq)
             else:
-                # Fallback: pyarrow row-group reads (fast for small batches).
+                # Fallback: scan by row index (no seq_idx column).
                 rows = _fetch_by_row_indices(REPS_PQ, set(missing_idx), [id_col, 'sequence'])
                 for row_idx_int, data in rows.items():
                     ann_pkl[str(row_idx_int)] = (data.get(id_col, ""), "", 0, 0, data['sequence'])

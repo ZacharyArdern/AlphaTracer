@@ -25,6 +25,8 @@ dependencies = [
     "igraph>=0.11",
     # Molecular dynamics (loop closing / minimisation)
     "openmm>=8.0",
+    # HTTP (async AFDB downloads)
+    "aiohttp>=3.9",
     # Progress bars
     "tqdm>=4.60",
 ]

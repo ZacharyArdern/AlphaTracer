@@ -88,12 +88,18 @@ def _get_frag_paths() -> dict[int, str]:
             with open(_FRAG_PATHS_FILE) as f:
                 _frag_paths = {int(k): v for k, v in json.load(f).items()}
         elif _HAS_LANCE:
+            print(f'  Building frag_paths.json (one-time, ~10s) → {_FRAG_PATHS_FILE}', flush=True)
             ds = _get_dataset()
             _frag_paths = {f.fragment_id: f.data_files()[0].path
                            for f in ds.get_fragments()}
+            _FRAG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(_FRAG_PATHS_FILE, 'w') as f:
+                json.dump({str(k): v for k, v in _frag_paths.items()}, f)
+            print(f'  Saved {len(_frag_paths)} fragment paths.', flush=True)
         else:
             raise FileNotFoundError(
-                f'frag_paths.json not found at {_FRAG_PATHS_FILE} and lance is not installed'
+                f'frag_paths.json not found at {_FRAG_PATHS_FILE} and lance is not installed.\n'
+                f'Install lance once to generate it:  pip install lance'
             )
     return _frag_paths
 

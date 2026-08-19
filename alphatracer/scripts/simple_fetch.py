@@ -50,13 +50,26 @@ except ImportError:
         from esm_atlas_fetch import fetch_esm_structures
     except ImportError as _e:
         _missing = str(_e)
+        _deps = 'aiohttp numpy requests brotli msgpack-python zstd polars'
         if 'afdb_fetch' not in _missing and 'esm_atlas_fetch' not in _missing:
-            sys.exit(f'Error: missing dependency — {_e}\nInstall with: pip install {_missing.split()[-1]}')
+            sys.exit(
+                f'Error: missing dependency — {_e}\n'
+                f'Install all required dependencies:\n'
+                f'  pip install {_deps}\n'
+                f'Note: lance is also needed on first ESM fetch to generate frag_paths.json:\n'
+                f'  pip install lance'
+            )
         sys.exit(
             'Error: could not import afdb_fetch / esm_atlas_fetch.\n'
             'Options:\n'
             '  1. Install AlphaTracer:  pip install -e /path/to/AlphaTracer\n'
-            '  2. Place afdb_fetch.py and esm_atlas_fetch.py in the same directory as simple_fetch.py'
+            '  2. Run from the AlphaTracer repo directory\n'
+            '  3. Copy afdb_fetch.py and esm_atlas_fetch.py to the current directory\n'
+            '\n'
+            'Required dependencies:\n'
+            f'  pip install {_deps}\n'
+            'Note: lance is also needed on first ESM fetch to generate frag_paths.json:\n'
+            '  pip install lance'
         )
 
 VERSION = "0.2"

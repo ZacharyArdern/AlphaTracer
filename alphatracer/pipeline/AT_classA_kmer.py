@@ -320,7 +320,7 @@ def _build_sidx(index_seqs_bin):
     temp parquet is streamed first, then cleaned up after indexing.
     """
     global _ID_COL
-    n = duckdb.connect().execute(f"SELECT count(*) FROM read_parquet('{REPS_PQ}')").fetchone()[0]
+    n = pl.scan_parquet(REPS_PQ).select(pl.len()).collect().item()
     print(f"  Building V2 inverted index from {n:,} sequences (runs once, cached)...", flush=True)
     t0 = time.time()
 
@@ -332,11 +332,8 @@ def _build_sidx(index_seqs_bin):
         # Write a renamed copy so index-seqs sees the expected column name.
         tmp_pq = REPS_PQ.rsplit('.', 1)[0] + "_idrenamed_tmp.pq"
         print(f"  Writing renamed parquet ('{id_col}' → 'AFDB_ID') → {tmp_pq}", flush=True)
-        other_cols = [c for c in pl.read_parquet(REPS_PQ, n_rows=0).columns if c != id_col]
-        col_sql = ", ".join([f'"{id_col}" AS "AFDB_ID"'] + [f'"{c}"' for c in other_cols])
-        duckdb.connect().execute(
-            f"COPY (SELECT {col_sql} FROM read_parquet('{REPS_PQ}'))"
-            f" TO '{tmp_pq}' (FORMAT PARQUET, COMPRESSION ZSTD)"
+        pl.read_parquet(REPS_PQ).rename({id_col: 'AFDB_ID'}).write_parquet(
+            tmp_pq, compression='zstd'
         )
         src_pq = tmp_pq
 

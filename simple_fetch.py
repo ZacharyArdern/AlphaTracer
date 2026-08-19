@@ -31,10 +31,23 @@ try:
     from alphatracer.utils.afdb_fetch import get_afdb_id, fetch_afdb_pdbs
     from alphatracer.utils.esm_atlas_fetch import fetch_esm_structures
 except ImportError:
-    sys.exit(
-        'Error: AlphaTracer is not installed.\n'
-        'Run: pip install -e /path/to/AlphaTracer'
-    )
+    import os as _os
+    _search = [
+        _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), 'alphatracer', 'utils'),
+        _os.getcwd(),
+    ]
+    for _p in _search:
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+    try:
+        from afdb_fetch import get_afdb_id, fetch_afdb_pdbs
+        from esm_atlas_fetch import fetch_esm_structures
+    except ImportError:
+        sys.exit(
+            'Error: could not import afdb_fetch / esm_atlas_fetch.\n'
+            'Either install AlphaTracer (pip install -e /path/to/AlphaTracer)\n'
+            'or run this script from the AlphaTracer repo directory.'
+        )
 
 VERSION = "0.1"
 

@@ -8,10 +8,11 @@ offset cache management, blob decoding, and PAE matrix fetch.
 
 import asyncio
 import io
+import json
 import logging
 import os
+import struct
 import subprocess
-import sys
 import time
 import zipfile
 from collections import defaultdict
@@ -84,7 +85,6 @@ def _get_frag_paths() -> dict[int, str]:
     global _frag_paths
     if not _frag_paths:
         if _FRAG_PATHS_FILE.exists():
-            import json
             with open(_FRAG_PATHS_FILE) as f:
                 _frag_paths = {int(k): v for k, v in json.load(f).items()}
         elif _HAS_LANCE:
@@ -166,17 +166,19 @@ def _pb_parse_fields(data: bytes) -> dict[int, list[tuple[int, object]]]:
             length, pos = _pb_read_varint(data, pos)
             val = data[pos:pos + length]; pos += length
         elif wire_type == 1:
-            import struct as _struct
-            val = _struct.unpack_from('<Q', data, pos)[0]; pos += 8
+            val = struct.unpack_from('<Q', data, pos)[0]; pos += 8
         else:
             break
         fields.setdefault(field_num, []).append((wire_type, val))
     return fields
 
 
-def _build_frag_offset_cache(fid: int) -> dict | None:
-    import struct
-    cache_file = _FRAG_CACHE_DIR / f'{fid}.npz'
+def _download_frag_col_offsets(fid: int, col_idx: int) -> dict | None:
+    """Shared tail-fetch + footer-parse + buf_offsets download logic.
+
+    Returns a dict with keys: layout, fname, url, buf_pos, data_start, offsets.
+    Returns None if the column's pages list is empty.
+    """
     fname = _get_frag_paths()[fid]
     url   = f'{_S3_HTTP}/{fname}'
 
@@ -195,12 +197,11 @@ def _build_frag_offset_cache(fid: int) -> dict | None:
     _, cmo_offset, gbo_offset, _, _, _, _ = struct.unpack_from('<QQQIIHHxxxx', footer)
     vals = struct.unpack_from(f'<{(gbo_offset-cmo_offset)//8}Q',
                               _tail_slice(cmo_offset, gbo_offset - cmo_offset))
-    col6_off, col6_sz = vals[12], vals[13]
-    col6_bytes = _tail_slice(col6_off, col6_sz)
-    top   = _pb_parse_fields(col6_bytes)
+    col_off, col_sz = vals[col_idx * 2], vals[col_idx * 2 + 1]
+    col_bytes = _tail_slice(col_off, col_sz)
+    top   = _pb_parse_fields(col_bytes)
     pages = top.get(2, [])
 
-    _FRAG_CACHE_DIR.mkdir(exist_ok=True)
     if not pages:
         return None
 
@@ -215,22 +216,48 @@ def _build_frag_offset_cache(fid: int) -> dict | None:
         r = requests.get(url, headers={'Range': f'bytes={buf1_pos}-{buf1_pos+buf1_size-1}'}, timeout=60)
         r.raise_for_status()
         offsets = np.frombuffer(r.content, dtype=np.int32).copy()
-        np.savez_compressed(cache_file, layout=np.array('FullZip'),
-                            buf0_pos=np.int64(buf0_pos), offsets=offsets)
-        return {'layout': 'FullZip', 'buf0_pos': buf0_pos, 'fname': fname, 'offsets': offsets}
+        return {'layout': 'FullZip', 'fname': fname, 'url': url,
+                'buf_pos': buf0_pos, 'data_start': 0, 'offsets': offsets}
 
-    buf2_pos = buf_offsets[2]
-    r_hdr = requests.get(url, headers={'Range': f'bytes={buf2_pos}-{buf2_pos+7}'}, timeout=30)
-    r_hdr.raise_for_status()
-    _, data_start = struct.unpack_from('<II', r_hdr.content)
-    r_off = requests.get(url,
-        headers={'Range': f'bytes={buf2_pos+8}-{buf2_pos+data_start-1}'}, timeout=60)
-    r_off.raise_for_status()
-    offsets = np.frombuffer(r_off.content, dtype=np.uint32).copy()
+    if len(buf_offsets) == 3:
+        buf2_pos = buf_offsets[2]
+        r_hdr = requests.get(url, headers={'Range': f'bytes={buf2_pos}-{buf2_pos+7}'}, timeout=30)
+        r_hdr.raise_for_status()
+        _, data_start = struct.unpack_from('<II', r_hdr.content)
+        r_off = requests.get(url,
+            headers={'Range': f'bytes={buf2_pos+8}-{buf2_pos+data_start-1}'}, timeout=60)
+        r_off.raise_for_status()
+        offsets = np.frombuffer(r_off.content, dtype=np.uint32).copy()
+        return {'layout': 'MiniBlock', 'fname': fname, 'url': url,
+                'buf_pos': buf2_pos, 'data_start': int(data_start), 'offsets': offsets}
+
+    return None
+
+
+def _build_frag_offset_cache(fid: int) -> dict | None:
+    cache_file = _FRAG_CACHE_DIR / f'{fid}.npz'
+    fname = _get_frag_paths()[fid]
+
+    _FRAG_CACHE_DIR.mkdir(exist_ok=True)
+
+    result = _download_frag_col_offsets(fid, col_idx=6)
+    if result is None:
+        return None
+
+    layout   = result['layout']
+    buf_pos  = result['buf_pos']
+    data_start = result['data_start']
+    offsets  = result['offsets']
+
+    if layout == 'FullZip':
+        np.savez_compressed(cache_file, layout=np.array('FullZip'),
+                            buf0_pos=np.int64(buf_pos), offsets=offsets)
+        return {'layout': 'FullZip', 'buf0_pos': buf_pos, 'fname': fname, 'offsets': offsets}
+
     np.savez_compressed(cache_file, layout=np.array('MiniBlock'),
-                        buf2_pos=np.int64(buf2_pos),
+                        buf2_pos=np.int64(buf_pos),
                         data_start=np.uint32(data_start), offsets=offsets)
-    return {'layout': 'MiniBlock', 'buf2_pos': buf2_pos, 'data_start': int(data_start),
+    return {'layout': 'MiniBlock', 'buf2_pos': buf_pos, 'data_start': int(data_start),
             'fname': fname, 'offsets': offsets}
 
 
@@ -269,45 +296,9 @@ def _blob_byte_range(cache: dict, frag_row: int) -> tuple[str, int, int]:
     return f'{_S3_HTTP}/{fname}', start, end
 
 
-def _fetch_one_blob_direct(cache: dict, frag_row: int) -> bytes:
-    url, start, end = _blob_byte_range(cache, frag_row)
-    r = requests.get(url, headers={'Range': f'bytes={start}-{end}'}, timeout=60)
-    r.raise_for_status()
-    raw = r.content
-    return zstd.decompress(raw[12:]) if cache['layout'] == 'FullZip' else raw
-
-
-async def _fetch_blobs_aiohttp(items: list[tuple[dict, dict]]) -> dict[str, bytes | None]:
-    sem       = asyncio.Semaphore(_ESM_CONCURRENCY)
-    connector = aiohttp.TCPConnector(limit=_ESM_CONCURRENCY)
-
-    async def _fetch_one(session, h, cache):
-        url, start, end = _blob_byte_range(cache, h['frag_row'])
-        for attempt in range(3):
-            try:
-                async with sem:
-                    async with session.get(
-                        url, headers={'Range': f'bytes={start}-{end}'},
-                        timeout=aiohttp.ClientTimeout(total=60),
-                    ) as resp:
-                        raw = await resp.read()
-                blob = zstd.decompress(raw[12:]) if cache['layout'] == 'FullZip' else raw
-                return h['protein_hash'], blob
-            except Exception:
-                if attempt == 2:
-                    return h['protein_hash'], None
-                await asyncio.sleep(2 ** attempt)
-        return h['protein_hash'], None
-
-    async with aiohttp.ClientSession(connector=connector) as session:
-        pairs = await asyncio.gather(*[_fetch_one(session, h, cache) for h, cache in items])
-    return dict(pairs)
-
-
 # ── PAE byte-range fetch ──────────────────────────────────────────────────────
 
 def _build_frag_pae_cache(fid: int) -> dict | None:
-    import struct
     cache_file = _PAE_CACHE_DIR / f'{fid}.npz'
     if cache_file.exists():
         try:
@@ -320,54 +311,16 @@ def _build_frag_pae_cache(fid: int) -> dict | None:
             cache_file.unlink(missing_ok=True)
 
     fname = _get_frag_paths()[fid]
-    url   = f'{_S3_HTTP}/{fname}'
-    _TAIL = 8192
-    r1 = requests.get(url, headers={'Range': f'bytes=-{_TAIL}'}, timeout=30)
-    r1.raise_for_status()
-    file_size  = int(r1.headers['Content-Range'].split('/')[-1])
-    tail_start = file_size - len(r1.content)
-    tail = r1.content
 
-    def _tail_slice(offset, size):
-        return tail[offset - tail_start: offset - tail_start + size]
-
-    footer = tail[-40:]
-    _, cmo_offset, gbo_offset, _, _, _, _ = struct.unpack_from('<QQQIIHHxxxx', footer)
-    n_vals = (gbo_offset - cmo_offset) // 8
-    vals = struct.unpack_from(f'<{n_vals}Q', tail[cmo_offset - tail_start:gbo_offset - tail_start])
-    col5_off, col5_sz = vals[10], vals[11]
-    col5_bytes = _tail_slice(col5_off, col5_sz)
-    top   = _pb_parse_fields(col5_bytes)
-    pages = top.get(2, [])
-    if not pages:
+    result = _download_frag_col_offsets(fid, col_idx=5)
+    if result is None:
         return None
 
-    page_fields = _pb_parse_fields(pages[0][1])
-    buf_offsets = _pb_read_packed_varints(page_fields[1][0][1]) if 1 in page_fields else []
-    buf_sizes   = _pb_read_packed_varints(page_fields[2][0][1]) if 2 in page_fields else []
-
-    if len(buf_offsets) == 2:
-        buf0_pos  = buf_offsets[0]
-        buf1_pos  = buf_offsets[1]
-        buf1_size = buf_sizes[1]
-        r = requests.get(url, headers={'Range': f'bytes={buf1_pos}-{buf1_pos+buf1_size-1}'}, timeout=60)
-        r.raise_for_status()
-        offsets  = np.frombuffer(r.content, dtype=np.int32).copy()
-        layout   = 'FullZip'
-        buf_data_pos = buf0_pos
-    elif len(buf_offsets) == 3:
-        buf2_pos = buf_offsets[2]
-        r_hdr = requests.get(url, headers={'Range': f'bytes={buf2_pos}-{buf2_pos+7}'}, timeout=30)
-        r_hdr.raise_for_status()
-        _, data_start = struct.unpack_from('<II', r_hdr.content)
-        r_off = requests.get(url,
-            headers={'Range': f'bytes={buf2_pos+8}-{buf2_pos+data_start-1}'}, timeout=60)
-        r_off.raise_for_status()
-        offsets  = np.frombuffer(r_off.content, dtype=np.uint32).copy()
-        layout   = 'MiniBlock'
-        buf_data_pos = buf2_pos + data_start
-    else:
-        return None
+    layout     = result['layout']
+    buf_pos    = result['buf_pos']
+    data_start = result['data_start']
+    offsets    = result['offsets']
+    buf_data_pos = buf_pos + data_start
 
     _PAE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(cache_file, layout=np.array(layout),
@@ -375,22 +328,15 @@ def _build_frag_pae_cache(fid: int) -> dict | None:
     return {'buf0_pos': buf_data_pos, 'fname': fname, 'offsets': offsets, 'layout': layout}
 
 
-async def _fetch_pae_aiohttp(items: list[tuple[dict, dict]]) -> dict[str, bytes | None]:
+async def _fetch_ranges_aiohttp(items, get_range, decompress) -> dict[str, bytes | None]:
     sem       = asyncio.Semaphore(_ESM_CONCURRENCY)
     connector = aiohttp.TCPConnector(limit=_ESM_CONCURRENCY)
 
     async def _fetch_one(session, h, cache):
-        offsets = cache['offsets']
-        base    = cache['buf0_pos']
-        layout  = cache.get('layout', 'FullZip')
-        fr      = h['frag_row']
-        if fr + 1 >= len(offsets):
+        range_result = get_range(h, cache)
+        if range_result is None:
             return h['protein_hash'], None
-        start = base + int(offsets[fr])
-        end   = base + int(offsets[fr + 1]) - 1
-        if start >= end:
-            return h['protein_hash'], None
-        url = f'{_S3_HTTP}/{cache["fname"]}'
+        url, start, end = range_result
         for attempt in range(3):
             try:
                 async with sem:
@@ -399,7 +345,7 @@ async def _fetch_pae_aiohttp(items: list[tuple[dict, dict]]) -> dict[str, bytes 
                         timeout=aiohttp.ClientTimeout(total=60),
                     ) as resp:
                         raw = await resp.read()
-                blob = zstd.decompress(raw[12:]) if layout == 'FullZip' else raw
+                blob = decompress(raw, cache)
                 return h['protein_hash'], blob
             except Exception:
                 if attempt == 2:
@@ -412,20 +358,30 @@ async def _fetch_pae_aiohttp(items: list[tuple[dict, dict]]) -> dict[str, bytes 
     return dict(pairs)
 
 
+# ── Module-level cache-build helpers ─────────────────────────────────────────
+
+def _build_struct_cache_safe(fid):
+    try:
+        return fid, _build_frag_offset_cache(fid)
+    except Exception:
+        return fid, None
+
+
+def _build_pae_cache_safe(fid):
+    try:
+        return fid, _build_frag_pae_cache(fid)
+    except Exception:
+        return fid, None
+
+
 def fetch_pae_matrices(hits: list[dict], n_workers: int = 16) -> dict[str, bytes]:
     if not hits:
         return {}
     fids_needed = list({h['fragment_id'] for h in hits if h.get('fragment_id', -1) >= 0})
 
-    def _build_one(fid):
-        try:
-            return fid, _build_frag_pae_cache(fid)
-        except Exception:
-            return fid, None
-
     pae_caches: dict[int, dict] = {}
     with ThreadPoolExecutor(max_workers=min(n_workers, len(fids_needed) or 1)) as exe:
-        for fid, cache in exe.map(_build_one, fids_needed):
+        for fid, cache in exe.map(_build_pae_cache_safe, fids_needed):
             if cache is not None:
                 pae_caches[fid] = cache
 
@@ -435,8 +391,25 @@ def fetch_pae_matrices(hits: list[dict], n_workers: int = 16) -> dict[str, bytes
     if not items:
         return {}
 
+    def _get_range_pae(h, cache):
+        offsets = cache['offsets']
+        base    = cache['buf0_pos']
+        fr      = h['frag_row']
+        if fr + 1 >= len(offsets):
+            return None
+        start = base + int(offsets[fr])
+        end   = base + int(offsets[fr + 1]) - 1
+        if start >= end:
+            return None
+        url = f'{_S3_HTTP}/{cache["fname"]}'
+        return url, start, end
+
+    def _decompress_pae(raw, cache):
+        layout = cache.get('layout', 'FullZip')
+        return zstd.decompress(raw[12:]) if layout == 'FullZip' else raw
+
     t0 = time.time()
-    fetched = asyncio.run(_fetch_pae_aiohttp(items))
+    fetched = asyncio.run(_fetch_ranges_aiohttp(items, _get_range_pae, _decompress_pae))
     ok = sum(1 for v in fetched.values() if v is not None)
     print(f'    [ESM PAE] fetched {ok}/{len(items)} in {time.time()-t0:.1f}s', flush=True)
     return {ph: b for ph, b in fetched.items() if b is not None}
@@ -519,9 +492,16 @@ def fetch_structure_blobs(hits: list[dict], n_workers: int = 16) -> dict[str, by
         else:
             tier3.append(h)
 
+    def _get_range_blob(h, cache):
+        url, start, end = _blob_byte_range(cache, h['frag_row'])
+        return url, start, end
+
+    def _decompress_blob(raw, cache):
+        return zstd.decompress(raw[12:]) if cache['layout'] == 'FullZip' else raw
+
     if tier2:
         _t2 = time.time()
-        fetched = asyncio.run(_fetch_blobs_aiohttp(tier2))
+        fetched = asyncio.run(_fetch_ranges_aiohttp(tier2, _get_range_blob, _decompress_blob))
         t2_ok = 0
         for ph, blob in fetched.items():
             if blob is not None:
@@ -534,15 +514,9 @@ def fetch_structure_blobs(hits: list[dict], n_workers: int = 16) -> dict[str, by
         _t3 = time.time()
         fids_to_build = list({h['fragment_id'] for h in tier3})
 
-        def _build_one(fid):
-            try:
-                return fid, _build_frag_offset_cache(fid)
-            except Exception:
-                return fid, None
-
         built: dict[int, dict] = {}
         with ThreadPoolExecutor(max_workers=min(n_workers, len(fids_to_build) or 1)) as exe:
-            for fid, cache in exe.map(_build_one, fids_to_build):
+            for fid, cache in exe.map(_build_struct_cache_safe, fids_to_build):
                 if cache is not None:
                     built[fid] = cache
 
@@ -557,7 +531,7 @@ def fetch_structure_blobs(hits: list[dict], n_workers: int = 16) -> dict[str, by
 
         t3_ok = 0
         if tier3_direct:
-            fetched3 = asyncio.run(_fetch_blobs_aiohttp(tier3_direct))
+            fetched3 = asyncio.run(_fetch_ranges_aiohttp(tier3_direct, _get_range_blob, _decompress_blob))
             for ph, blob in fetched3.items():
                 if blob is not None:
                     _save_cached_blob(ph, blob)

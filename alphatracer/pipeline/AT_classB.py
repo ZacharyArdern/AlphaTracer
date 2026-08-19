@@ -32,10 +32,10 @@ import polars as pl
 import parasail
 import gemmi
 
-from alphatracer.utils.structures_fetch import (
-    AFDB_VERSION, get_afdb_id, afdb_local_pdb, is_valid_pdb,
-    esm_local_pdb, _ESM_DIR, fetch_afdb_pdbs, fetch_esm_structures,
+from alphatracer.utils.afdb_fetch import (
+    AFDB_VERSION, get_afdb_id, afdb_local_pdb, is_valid_pdb, fetch_afdb_pdbs,
 )
+from alphatracer.utils.esm_atlas_fetch import esm_local_pdb, _ESM_DIR, fetch_esm_structures
 from openmm import (System, HarmonicBondForce, HarmonicAngleForce,
                     PeriodicTorsionForce, LangevinMiddleIntegrator, Platform)
 from openmm.app import Topology, Simulation, PDBFile, Element
@@ -51,7 +51,7 @@ ONE_TO_THREE = {
     'S': 'SER', 'T': 'THR', 'V': 'VAL', 'W': 'TRP', 'Y': 'TYR',
 }
 
-# AFDB_VERSION imported from alphatracer.utils.structures_fetch
+# AFDB_VERSION imported from alphatracer.utils.afdb_fetch
 
 # Ideal backbone geometry (Å and radians)
 _BL = {'C-N': 1.335, 'N-CA': 1.460, 'CA-C': 1.522, 'C-O': 1.229, 'CA-CB': 1.526}
@@ -134,7 +134,7 @@ def parse_args():
 
 # get_afdb_id, afdb_local_pdb, esm_local_pdb (_esm_local_pdb alias below),
 # _ESM_DIR, is_valid_pdb (_is_valid_pdb alias below), fetch_afdb_pdbs,
-# fetch_esm_structures — all imported from alphatracer.utils.structures_fetch
+# fetch_esm_structures — all imported from alphatracer.utils.afdb_fetch / esm_atlas_fetch
 
 _HAS_DB_TYPE = False  # overridden at runtime by auto-detection from allhits.pq
 

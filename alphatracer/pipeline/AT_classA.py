@@ -33,7 +33,7 @@ from pathlib import Path
 import polars as pl
 import parasail
 import gemmi
-from alphatracer.utils.structures_fetch import (
+from alphatracer.utils.afdb_fetch import (
     AFDB_VERSION, get_afdb_id, afdb_url, afdb_local_pdb, is_valid_pdb,
     fetch_afdb_pdbs, parse_fasta,
 )

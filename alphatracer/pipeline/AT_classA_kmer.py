@@ -30,11 +30,11 @@ import polars as pl
 import parasail
 import gemmi
 import duckdb
-from alphatracer.utils.structures_fetch import (
+from alphatracer.utils.afdb_fetch import (
     AFDB_VERSION, get_afdb_id, afdb_local_pdb, is_valid_pdb,
-    esm_local_pdb, _ESM_DIR, fetch_afdb_pdbs, fetch_esm_structures,
-    parse_fasta,
+    fetch_afdb_pdbs, parse_fasta,
 )
+from alphatracer.utils.esm_atlas_fetch import esm_local_pdb, _ESM_DIR, fetch_esm_structures
 
 try:
     from tqdm import tqdm
@@ -60,7 +60,7 @@ _HAS_DB_TYPE       = False  # True for merged AFDB+ESMAtlas DBs with db_type col
 _HAS_SEQ_IDX       = False  # True when parquet has seq_idx integer column (enables DuckDB min/max pruning)
 _IS_STANDALONE_ESM = False  # True for standalone ESMAtlas DBs (header+sequence only, no db_type col)
 
-# _ESM_DIR imported from alphatracer.utils.structures_fetch
+# _ESM_DIR imported from alphatracer.utils.esm_atlas_fetch
 
 
 def _configure_db(sketch_db: str | None = None) -> None:
@@ -110,7 +110,7 @@ _SKETCH_RS_CARGO_TARGET = os.path.join(
 _SKETCH_RS_BIN = os.path.join(_SKETCH_RS_CARGO_TARGET, 'release')
 
 # AFDB_VERSION, get_afdb_id, afdb_local_pdb, is_valid_pdb, esm_local_pdb
-# imported from alphatracer.utils.structures_fetch
+# imported from alphatracer.utils.afdb_fetch
 
 K            = 9
 MAX_FREQ     = 0.001
@@ -240,12 +240,13 @@ def is_classA(qseq_alg, sseq_alg, alg_comp, window, threshold):
 
 
 # get_afdb_id, afdb_local_pdb, is_valid_pdb, _ESM_DIR, esm_local_pdb,
-# fetch_afdb_pdbs, fetch_esm_structures imported from alphatracer.utils.structures_fetch
+# fetch_afdb_pdbs imported from alphatracer.utils.afdb_fetch
+# fetch_esm_structures imported from alphatracer.utils.esm_atlas_fetch
 
 
 def _fetch_pdb(afdb_id, pdb_dir):
     """Synchronous single-file fetch (on-demand fallback)."""
-    from alphatracer.utils.structures_fetch import _fetch_afdb_pdbs_async
+    from alphatracer.utils.afdb_fetch import _fetch_afdb_pdbs_async
     return asyncio.run(_fetch_afdb_pdbs_async([afdb_id], pdb_dir))[afdb_id]
 
 

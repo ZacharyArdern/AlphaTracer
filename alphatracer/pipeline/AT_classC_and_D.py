@@ -83,10 +83,10 @@ from alphatracer.pipeline import AT_classA as _A
 from alphatracer.pipeline import AT_classB as _B
 from alphatracer.utils.pae_to_domains import (parse_pae_file, domains_from_pae_matrix_igraph,
                                                parse_pae_batch_rust, domains_from_pae_subsampled)
-from alphatracer.utils.structures_fetch import (
-    AFDB_VERSION, afdb_local_pdb, afdb_pae_local_path, afdb_pae_url,
-    esm_local_pdb, _ESM_DIR, fetch_afdb_pae, fetch_esm_structures,
+from alphatracer.utils.afdb_fetch import (
+    AFDB_VERSION, afdb_local_pdb, afdb_pae_local_path, afdb_pae_url, fetch_afdb_pae,
 )
+from alphatracer.utils.esm_atlas_fetch import esm_local_pdb, _ESM_DIR, fetch_esm_structures
 
 ONE_TO_THREE = _A.ONE_TO_THREE
 
@@ -267,7 +267,7 @@ def _resolve_esm_fragment_ids(rows):
 # ── PAE helpers ───────────────────────────────────────────────────────────────
 
 # _pae_local_path, _pae_url, stage_download_pae removed — use
-# afdb_pae_local_path, afdb_pae_url, fetch_afdb_pae from utils.structures_fetch
+# afdb_pae_local_path, afdb_pae_url, fetch_afdb_pae from utils.afdb_fetch
 
 # Alias for internal references still using the old name
 _pae_local_path = afdb_pae_local_path
@@ -1241,7 +1241,7 @@ def _frag_template_search(frag_dict: dict, work_dir: str) -> tuple[dict, dict]:
         local_pdb = _A.afdb_local_pdb(afdb_id, _FRAG_PDB_DIR)
         if not os.path.exists(local_pdb):
             try:
-                from alphatracer.utils.structures_fetch import AFDB_VERSION
+                from alphatracer.utils.afdb_fetch import AFDB_VERSION
                 import urllib.request as _ur
                 url = (f'https://alphafold.ebi.ac.uk/files/'
                        f'{afdb_id}-model_v{AFDB_VERSION}.pdb')
@@ -1351,7 +1351,7 @@ def _frag_template_search(frag_dict: dict, work_dir: str) -> tuple[dict, dict]:
             prot_hash, esm_seq, qa, sa, identity, coverage = best_hit
 
             # Fetch ESM PDB if not cached
-            from alphatracer.utils.structures_fetch import (
+            from alphatracer.utils.esm_atlas_fetch import (
                 fetch_esm_structures, esm_local_pdb as _esm_local_pdb)
             local_pdb = _esm_local_pdb(prot_hash, _FRAG_PDB_DIR)
             if not os.path.exists(local_pdb):
@@ -2388,7 +2388,7 @@ def main():
         print(f'\nClass D: cannot find {filtered_fasta} — skipping.')
         return
 
-    from alphatracer.utils.structures_fetch import parse_fasta as _parse_fasta
+    from alphatracer.utils.afdb_fetch import parse_fasta as _parse_fasta
     all_seqs   = {r.id: r.seq for r in _parse_fasta(filtered_fasta)}
     classD_seqs = {sid: seq for sid, seq in all_seqs.items()
                    if sid not in covered_ids}

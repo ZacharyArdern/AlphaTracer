@@ -48,12 +48,15 @@ except ImportError:
     try:
         from afdb_fetch import get_afdb_id, fetch_afdb_pdbs
         from esm_atlas_fetch import fetch_esm_structures
-    except ImportError:
+    except ImportError as _e:
+        _missing = str(_e)
+        if 'afdb_fetch' not in _missing and 'esm_atlas_fetch' not in _missing:
+            sys.exit(f'Error: missing dependency — {_e}\nInstall with: pip install {_missing.split()[-1]}')
         sys.exit(
             'Error: could not import afdb_fetch / esm_atlas_fetch.\n'
             'Options:\n'
             '  1. Install AlphaTracer:  pip install -e /path/to/AlphaTracer\n'
-            '  2. Run from the AlphaTracer repo directory'
+            '  2. Place afdb_fetch.py and esm_atlas_fetch.py in the same directory as simple_fetch.py'
         )
 
 VERSION = "0.2"

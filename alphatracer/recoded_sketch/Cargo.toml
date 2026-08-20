@@ -22,7 +22,7 @@ path = "src/index_seqs.rs"
 
 [[bin]]
 name = "parse-pae"
-path = "src/utils/parse_pae.rs"
+path = "src/parse_pae.rs"
 
 [dependencies]
 rayon = "1"

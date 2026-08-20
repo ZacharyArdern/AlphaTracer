@@ -86,7 +86,7 @@ def _import_esm_fetch():
         )
 
 VERSION = "0.2"
-GIT_HASH = "ae93e80"
+GIT_HASH = "2589008"
 
 BANNER = (
     f"simple_fetch.py  v{VERSION}  ({GIT_HASH})  —  AlphaTracer package\n"
@@ -137,16 +137,17 @@ def parse_esm_sseqid(sseqid: str) -> dict:
     Falls back gracefully if format doesn't match.
     """
     parts = sseqid.split('|')
+    ph = parts[0] if parts else sseqid
     if len(parts) == 3:
         try:
             return {
-                'protein_hash': parts[0],
+                'protein_hash': ph,
                 'fragment_id': int(parts[1]),
                 'frag_row': int(parts[2]),
             }
         except ValueError:
             pass
-    return {'protein_hash': sseqid, 'fragment_id': -1, 'frag_row': -1}
+    return {'protein_hash': ph, 'fragment_id': -1, 'frag_row': -1}
 
 
 # ── DIAMOND search ────────────────────────────────────────────────────────────

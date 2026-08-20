@@ -177,6 +177,16 @@ pub struct Index {
 
 impl Index {
     pub fn data(&self) -> &[u8] { &self.mmap[..] }
+
+    /// Advise the OS it can reclaim sidx pages immediately.
+    /// Called after search completes so the pages don't linger in the macOS page cache
+    /// while a second database search loads its own sidx.
+    pub fn advise_free(&self) {
+        #[cfg(unix)]
+        // SAFETY: we only call this after search is complete and before drop;
+        // no code accesses mmap pages after this point.
+        let _ = unsafe { self.mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) };
+    }
 }
 
 pub fn load_index(path: &str) -> Index {

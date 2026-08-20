@@ -35,6 +35,7 @@ pub fn search_fasta(
 
         let progress = AtomicUsize::new(0);
         let results  = run_search(&idx, &query_sketches, min_shared, top_k, n_hs, &progress);
+        idx.advise_free();
 
         let mut out = Vec::new();
         for (qi, hits) in results.iter().enumerate() {

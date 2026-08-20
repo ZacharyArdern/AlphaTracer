@@ -94,7 +94,7 @@ def is_valid_pdb(path: str) -> bool:
     try:
         with open(path, 'rb') as f:
             header = f.read(6).decode('ascii', errors='ignore')
-        return header.strip()[:6] in ('HEADER', 'REMARK', 'ATOM  ', 'MODEL ')
+        return header[:6].rstrip() in ('HEADER', 'REMARK', 'ATOM', 'MODEL')
     except Exception:
         return False
 

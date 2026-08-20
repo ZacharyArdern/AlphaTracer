@@ -13,6 +13,13 @@ from pathlib import Path
 import aiohttp
 
 AFDB_VERSION = 6
+# Non-UniProt entries (zero-padded 16-digit numeric IDs like AF-0000000004497602) use v1
+_NUMERIC_ID_RE = re.compile(r'^AF-\d{16}$')
+
+
+def _model_version(afdb_id: str) -> int:
+    """Return the correct model version for an AFDB accession."""
+    return 1 if _NUMERIC_ID_RE.match(afdb_id) else AFDB_VERSION
 
 
 # ── FASTA parsing ─────────────────────────────────────────────────────────────
@@ -66,17 +73,21 @@ def get_afdb_id(sseqid: str) -> str | None:
 
 
 def afdb_url(afdb_id: str) -> str:
-    return f'https://alphafold.ebi.ac.uk/files/{afdb_id}-model_v{AFDB_VERSION}.pdb'
+    v = _model_version(afdb_id)
+    return f'https://alphafold.ebi.ac.uk/files/{afdb_id}-model_v{v}.pdb'
 
 def afdb_local_pdb(afdb_id: str, pdb_dir: str) -> str:
-    return os.path.join(pdb_dir, f'{afdb_id}-model_v{AFDB_VERSION}.pdb')
+    v = _model_version(afdb_id)
+    return os.path.join(pdb_dir, f'{afdb_id}-model_v{v}.pdb')
 
 def afdb_pae_local_path(afdb_id: str, pae_dir: str) -> str:
-    return os.path.join(pae_dir, f'{afdb_id}-predicted_aligned_error_v{AFDB_VERSION}.json')
+    v = _model_version(afdb_id)
+    return os.path.join(pae_dir, f'{afdb_id}-predicted_aligned_error_v{v}.json')
 
 def afdb_pae_url(afdb_id: str) -> str:
+    v = _model_version(afdb_id)
     return (f'https://alphafold.ebi.ac.uk/files/'
-            f'{afdb_id}-predicted_aligned_error_v{AFDB_VERSION}.json')
+            f'{afdb_id}-predicted_aligned_error_v{v}.json')
 
 
 def is_valid_pdb(path: str) -> bool:

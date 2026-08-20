@@ -25,6 +25,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
 
+import resource
 import aiohttp
 import polars as pl
 import parasail
@@ -68,6 +69,12 @@ _IS_STANDALONE_ESM = False  # True for standalone ESMAtlas DBs (header+sequence 
 
 # _ESM_DIR imported from alphatracer.utils.esm_atlas_fetch
 
+
+def _rss_gb() -> str:
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # macOS returns bytes in ru_maxrss; Linux returns kilobytes
+    gb = rss / 1e9 if sys.platform == 'darwin' else rss / 1e6
+    return f'{gb:.1f} GB RSS'
 
 def _configure_db(sketch_db: str | None = None) -> None:
     """Probe parquet schema and set _ID_COL / _HAS_ANN / _HAS_DB_TYPE.
@@ -413,7 +420,7 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
         parsed = [(q, str(s), sh, j) for q, s, sh, j in raw_results]
         targets = {str(s) for _, s, _, _ in raw_results}
         is_row_idx = True  # recoded_sketch always returns row indices
-        print(f"  {len(parsed)} hits in {time.time()-t0:.1f}s", flush=True)
+        print(f"  {len(parsed)} hits in {time.time()-t0:.1f}s  [MEM] {_rss_gb()}", flush=True)
     else:
         proc = subprocess.Popen(
             [search_bin, SIDX_CACHE, filtered_fasta,
@@ -476,6 +483,7 @@ def stage_kmer_search(filtered_fasta, query_seq_dict, outfile, top_k):
     missing = targets - ann_pkl.keys()
     print(f"  Annotations: {len(targets)} targets "
           f"({len(targets) - len(missing)} from cache, {len(missing)} new)...", flush=True)
+    print(f"  [MEM] after ann_cache load ({len(ann_pkl):,} entries): {_rss_gb()}", flush=True)
     if missing:
         t_ann = time.time()
         if is_row_idx:
@@ -958,6 +966,7 @@ def main():
     filtered_fasta = os.path.join(outdir, 'input_seqs_filtered.fa')
     n_in, n_filtered, query_seq_dict = stage_filter(args.input, filtered_fasta)
     print(f'  {n_in} input → {n_filtered} passed filter')
+    print(f'  [MEM] after filter: {_rss_gb()}')
 
     # ── 2. Kmer search ────────────────────────────────────────────────────────
     kmer_out = os.path.join(outdir, 'kmer_hits.tsv')
@@ -975,7 +984,9 @@ def main():
             print(f'\n  DB {_db_idx + 1}/{len(_db_paths)}: {_label}'
                   + (f'  ({len(_current_seq_dict)} queries remaining)' if _db_idx > 0 else ''))
             _configure_db(_db_path)
+        print(f'  [MEM] before DB {_db_idx+1} search: {_rss_gb()}')
         _hits_part = stage_kmer_search(_current_fasta, _current_seq_dict, kmer_out, args.top_k)
+        print(f'  [MEM] after DB {_db_idx+1} search: {_rss_gb()} ({len(_hits_part)} hits)')
         if 'db_type' not in _hits_part.columns and len(_hits_part) > 0:
             _hits_part = _hits_part.with_columns([
                 pl.lit('afdb').alias('db_type'),
@@ -993,6 +1004,7 @@ def main():
                 pl.col('full_qseq').str.len_chars() > 0,
                 pl.col('full_sseq').str.len_chars() > 0,
             )
+            print(f'  [MEM] before interim classify: {_rss_gb()} ({len(_hits_so_far)} hits in DataFrame)')
             print(f'  Classifying hits from DB {_db_idx + 1} to skip confirmed Class A queries...')
             _t_cls = time.time()
             _interim_classA = stage_align_and_classify(
@@ -1001,6 +1013,7 @@ def main():
             _classA_ids |= _new_classA
             print(f'  {len(_classA_ids)} Class A confirmed so far — '
                   f'skipping from remaining DB searches  [{time.time()-_t_cls:.1f}s]')
+            print(f'  [MEM] after interim classify: {_rss_gb()}')
 
             # Write reduced FASTA for next DB search.
             _current_seq_dict = {k: v for k, v in query_seq_dict.items()
@@ -1023,6 +1036,7 @@ def main():
     hits_df.write_parquet(os.path.join(outdir, 'kmer_hits.pq'))
     hits_df.write_parquet(os.path.join(outdir, 'allhits.pq'))
     print(f'  {len(hits_df)} hits across {n_queries_hit} queries  [{time.time()-t2:.1f}s]')
+    print(f'  [MEM] after kmer search complete: {_rss_gb()}')
     print(f'  Raw hits saved to: {kmer_out}')
 
     if len(hits_df) == 0:

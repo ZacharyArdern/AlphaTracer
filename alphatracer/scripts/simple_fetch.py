@@ -7,8 +7,21 @@
 #   pip install -e /path/to/AlphaTracer
 #
 # -d AT_Data/  points to a data directory containing:
-#   ├── *.dmnd                        DIAMOND databases (auto-discovered in search mode)
-#   └── esm_atlas_fragment_cache/     ESM offset cache (.npz files + frag_paths.json)
+#
+#   Required (must be provided):
+#   ├── *.dmnd                              DIAMOND databases (auto-discovered in search mode)
+#   │                                         expect up to one AFDB and one ESM database
+#   └── folds_1B_index/merged/prefix_*.parquet
+#                                           ESM protein_hash → (fragment_id, frag_row) lookup
+#                                           index; 16 files, ~19 GB total. Required because
+#                                           ESM sseqids do not embed fragment coordinates.
+#
+#   Auto-built on first run if missing:
+#   └── esm_atlas_fragment_cache/
+#       ├── frag_paths.json               fragment_id → S3 path map; built from S3 via lance
+#       │                                   (~10s, requires: pip install lance)
+#       └── {fragment_id}.npz             per-fragment byte-offset caches; built on demand
+#                                           by downloading column metadata from S3
 #
 # ── Mode 1: run DIAMOND then fetch ───────────────────────────────────────────
 #   simple_fetch.py -q query.fasta -d AT_Data/ -o hits \
@@ -33,49 +46,50 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+# afdb_fetch is imported at module level (no path config needed).
+# esm_atlas_fetch is imported lazily inside main() after AT_ESM_DIR is set,
+# because its _ESM_DIR / _INDEX_DIR are computed at import time from that env var.
 try:
     from alphatracer.utils.afdb_fetch import get_afdb_id, fetch_afdb_pdbs
-    from alphatracer.utils.esm_atlas_fetch import fetch_esm_structures
+    _AFDB_FETCH_PKG = 'alphatracer.utils.esm_atlas_fetch'
 except ImportError:
     _here = os.path.dirname(os.path.abspath(__file__))
-    _search = [
-        os.path.join(_here, 'alphatracer', 'utils'),
-        os.getcwd(),
-    ]
-    for _p in _search:
+    for _p in [os.path.join(_here, 'alphatracer', 'utils'), os.getcwd()]:
         if _p not in sys.path:
             sys.path.insert(0, _p)
     try:
         from afdb_fetch import get_afdb_id, fetch_afdb_pdbs
-        from esm_atlas_fetch import fetch_esm_structures
+        _AFDB_FETCH_PKG = 'esm_atlas_fetch'
     except ImportError as _e:
-        _missing = str(_e)
         _deps = 'aiohttp numpy requests brotli msgpack-python zstd polars'
-        if 'afdb_fetch' not in _missing and 'esm_atlas_fetch' not in _missing:
-            sys.exit(
-                f'Error: missing dependency — {_e}\n'
-                f'Install all required dependencies:\n'
-                f'  pip install {_deps}\n'
-                f'Note: lance is also needed on first ESM fetch to generate frag_paths.json:\n'
-                f'  pip install lance'
-            )
         sys.exit(
-            'Error: could not import afdb_fetch / esm_atlas_fetch.\n'
-            'Options:\n'
-            '  1. Install AlphaTracer:  pip install -e /path/to/AlphaTracer\n'
-            '  2. Run from the AlphaTracer repo directory\n'
-            '  3. Copy afdb_fetch.py and esm_atlas_fetch.py to the current directory\n'
-            '\n'
-            'Required dependencies:\n'
+            f'Error: could not import afdb_fetch — {_e}\n'
+            f'Install AlphaTracer or run from the repo directory.\n'
+            f'  pip install {_deps}'
+        )
+
+
+def _import_esm_fetch():
+    """Import fetch_esm_structures after AT_ESM_DIR has been set in the environment."""
+    try:
+        if _AFDB_FETCH_PKG.startswith('alphatracer'):
+            from alphatracer.utils.esm_atlas_fetch import fetch_esm_structures
+        else:
+            from esm_atlas_fetch import fetch_esm_structures
+        return fetch_esm_structures
+    except ImportError as e:
+        _deps = 'aiohttp numpy requests brotli msgpack-python zstd polars'
+        sys.exit(
+            f'Error: could not import esm_atlas_fetch — {e}\n'
             f'  pip install {_deps}\n'
-            'Note: lance is also needed on first ESM fetch to generate frag_paths.json:\n'
-            '  pip install lance'
+            'Note: lance is also needed on first ESM fetch:  pip install lance'
         )
 
 VERSION = "0.2"
+GIT_HASH = "ea1d497"
 
 BANNER = (
-    f"simple_fetch.py  v{VERSION}  —  AlphaTracer package\n"
+    f"simple_fetch.py  v{VERSION}  ({GIT_HASH})  —  AlphaTracer package\n"
     "Fetch PDB structures from AlphaFold DB and/or ESM Atlas.\n"
     "Author: Zachary Ardern <z.ardern@gmail.com>"
 )
@@ -256,6 +270,8 @@ def main():
                         help='Best hits to keep per query, ranked by bitscore (default: 1)')
     parser.add_argument('--outdir', default='pdb_hits',
                         help='Output directory for PDB files (default: pdb_hits)')
+    parser.add_argument('--force', action='store_true',
+                        help='Re-run DIAMOND even if hits file already exists')
 
     args = parser.parse_args()
 
@@ -264,6 +280,10 @@ def main():
     data_dir = Path(args.d)
     if not data_dir.is_dir():
         parser.error(f'-d {data_dir}: directory not found')
+
+    # Let -d act as AT_ESM_DIR default so ESM hash lookup works on remote systems
+    if 'AT_ESM_DIR' not in os.environ:
+        os.environ['AT_ESM_DIR'] = str(data_dir.resolve())
 
     frag_cache_dir = data_dir / ESM_FRAG_CACHE_SUBDIR
     print(f'Data directory:  {data_dir.resolve()}')
@@ -313,8 +333,12 @@ def main():
 
         for i, db in enumerate(dmnd_files, 1):
             out_path = f'{args.o}_{i}.tsv'
-            print(f'[{i}/{len(dmnd_files)}] Searching against {os.path.basename(db)} → {out_path}')
-            run_diamond(args.q, db, out_path, args.id, args.qcov, args.targets, args.threads)
+            if os.path.exists(out_path) and not args.force:
+                print(f'[{i}/{len(dmnd_files)}] Skipping {os.path.basename(db)} '
+                      f'— hits file exists: {out_path}  (use --force to rerun)')
+            else:
+                print(f'[{i}/{len(dmnd_files)}] Searching against {os.path.basename(db)} → {out_path}')
+                run_diamond(args.q, db, out_path, args.id, args.qcov, args.targets, args.threads)
             db_tag = infer_db_tag(out_path)
             print(f'       Detected database type: {db_tag.upper()}')
             hits_files.append((out_path, db_tag))
@@ -406,6 +430,7 @@ def main():
             unique_rows.append(parse_esm_sseqid(sseqid))
 
         print(f'\nFetching {len(unique_rows)} ESM Atlas PDB file(s) → {args.outdir}/')
+        fetch_esm_structures = _import_esm_fetch()
         fetch_esm_structures(
             unique_rows,
             pdb_dir=args.outdir,

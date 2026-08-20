@@ -99,6 +99,24 @@ simple_fetch.py -q input.fa -d ./AT_Data/
 
 See the [simple_fetch.py wiki page](https://github.com/ZacharyArdern/AlphaTracer/wiki/simple_fetch) for full documentation.
 
+### simple_fetch data directory
+
+The `-d AT_Data/` directory must contain:
+
+| Path | Size | Notes |
+|------|------|-------|
+| `*.dmnd` | varies | DIAMOND database(s); up to one AFDB and one ESM Atlas |
+| `folds_1B_index/merged/prefix_*.parquet` | ~19 GB | ESM protein_hash → fragment lookup index (16 files); required because ESM sseqids do not embed fragment coordinates |
+
+The following are **auto-built on first run** if absent:
+
+| Path | Notes |
+|------|-------|
+| `esm_atlas_fragment_cache/frag_paths.json` | Maps fragment_id → S3 path; built from S3 via `lance` (~10 s). Requires `pip install lance`. |
+| `esm_atlas_fragment_cache/{id}.npz` | Per-fragment byte-offset caches; built on demand per fragment fetched. |
+
+`AT_ESM_DIR` is set automatically to the `-d` directory so no environment variable configuration is needed.
+
 ---
 
 ## Dependencies

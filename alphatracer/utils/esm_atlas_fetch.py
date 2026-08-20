@@ -785,7 +785,10 @@ def fetch_esm_structures(esm_rows, pdb_dir: str, n_workers: int = 8,
                     if needs_pdb:
                         hits.append({'fragment_id': -1, 'frag_row': -1, 'protein_hash': ph})
         except Exception as e:
-            print(f'  [WARN] ESM lookup_hashes failed: {e}', flush=True)
+            print(f'  [WARN] ESM index lookup failed: {e} — falling back to Biohub API for all', flush=True)
+            for ph, needs_pdb, _ in need_lookup:
+                if needs_pdb:
+                    hits.append({'fragment_id': -1, 'frag_row': -1, 'protein_hash': ph})
 
     if not hits and not hits_with_coords:
         return

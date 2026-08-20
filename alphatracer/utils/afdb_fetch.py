@@ -115,6 +115,8 @@ async def _fetch_afdb_pdbs_async(afdb_ids, pdb_dir: str) -> dict:
             try:
                 async with session.get(url) as resp:
                     data = await resp.read()
+                if data[:2] == b'\x1f\x8b':
+                    data = gzip.decompress(data)
                 with open(path, 'wb') as f:
                     f.write(data)
                 if is_valid_pdb(path):

@@ -50,7 +50,7 @@ from pathlib import Path
 # esm_atlas_fetch is imported lazily inside main() after AT_ESM_DIR is set,
 # because its _ESM_DIR / _INDEX_DIR are computed at import time from that env var.
 try:
-    from alphatracer.utils.afdb_fetch import get_afdb_id, fetch_afdb_pdbs
+    from alphatracer.utils.afdb_fetch import get_afdb_id, fetch_afdb_pdbs, afdb_local_pdb
     _AFDB_FETCH_PKG = 'alphatracer.utils.esm_atlas_fetch'
 except ImportError:
     _here = os.path.dirname(os.path.abspath(__file__))
@@ -58,7 +58,7 @@ except ImportError:
         if _p not in sys.path:
             sys.path.insert(0, _p)
     try:
-        from afdb_fetch import get_afdb_id, fetch_afdb_pdbs
+        from afdb_fetch import get_afdb_id, fetch_afdb_pdbs, afdb_local_pdb
         _AFDB_FETCH_PKG = 'esm_atlas_fetch'
     except ImportError as _e:
         _deps = 'aiohttp numpy requests brotli msgpack-python zstd polars'
@@ -86,7 +86,7 @@ def _import_esm_fetch():
         )
 
 VERSION = "0.2"
-GIT_HASH = "ea1d497"
+GIT_HASH = "ae93e80"
 
 BANNER = (
     f"simple_fetch.py  v{VERSION}  ({GIT_HASH})  —  AlphaTracer package\n"
@@ -415,8 +415,14 @@ def main():
                 print(f'  [WARN] Cannot parse AFDB accession from sseqid: {h["sseqid"]}')
         unique_ids = list(dict.fromkeys(afdb_ids))
         if unique_ids:
-            print(f'\nFetching {len(unique_ids)} AFDB PDB file(s) → {args.outdir}/')
-            fetch_afdb_pdbs(unique_ids, args.outdir)
+            n_exist = sum(1 for aid in unique_ids if os.path.exists(afdb_local_pdb(aid, args.outdir)))
+            n_fetch = len(unique_ids) - n_exist
+            msg = f'\nFetching {n_fetch} AFDB PDB file(s) → {args.outdir}/'
+            if n_exist:
+                msg += f'  ({n_exist} already present, skipping)'
+            print(msg)
+            if n_fetch:
+                fetch_afdb_pdbs(unique_ids, args.outdir)
 
     # ── Fetch ESM Atlas ───────────────────────────────────────────────────────
 
@@ -429,13 +435,20 @@ def main():
             seen.add(sseqid)
             unique_rows.append(parse_esm_sseqid(sseqid))
 
-        print(f'\nFetching {len(unique_rows)} ESM Atlas PDB file(s) → {args.outdir}/')
-        fetch_esm_structures = _import_esm_fetch()
-        fetch_esm_structures(
-            unique_rows,
-            pdb_dir=args.outdir,
-            frag_cache_dir=str(frag_cache_dir) if frag_cache_dir.exists() else None,
-        )
+        n_exist = sum(1 for r in unique_rows
+                      if os.path.exists(os.path.join(args.outdir, f'esm_{r["protein_hash"]}.pdb')))
+        n_fetch = len(unique_rows) - n_exist
+        msg = f'\nFetching {n_fetch} ESM Atlas PDB file(s) → {args.outdir}/'
+        if n_exist:
+            msg += f'  ({n_exist} already present, skipping)'
+        print(msg)
+        if n_fetch:
+            fetch_esm_structures = _import_esm_fetch()
+            fetch_esm_structures(
+                unique_rows,
+                pdb_dir=args.outdir,
+                frag_cache_dir=str(frag_cache_dir) if frag_cache_dir.exists() else None,
+            )
 
     print(f'\nDone.  PDB files written to: {os.path.abspath(args.outdir)}/')
 

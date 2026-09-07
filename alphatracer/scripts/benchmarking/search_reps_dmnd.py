@@ -29,7 +29,7 @@ WORK_DIR       = Path('.')
 
 AFDB_FA        = Path('AFDBv6_uniref50_reps.fasta')
 ESM_FA         = Path('esm_plddt60_non-afdb_reps.fasta')
-AFDB_CHUNK_DIR = Path('afdb_chunks')
+AFDB_CHUNK_DIR = Path('afdb_reps_chunks')
 ESM_CHUNK_DIR  = Path('esm_reps_chunks')
 AFDB_HITS_DIR  = Path('afdb_hits')
 ESM_HITS_DIR   = Path('esm_hits')

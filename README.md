@@ -41,13 +41,16 @@ pip install torch --index-url https://download.pytorch.org/whl/cu121
 pip install -e ".[cpu]"
 ```
 
-**Rust toolchain** is required for the kmer sketch search (Classes A–C). Binaries are compiled automatically on first run (~30 s) and cached to `~/.cache/alphatracer/`.
+**Kmer sketch search** (Classes A–C) uses a pre-compiled Rust extension (`recoded_sketch`), which is installed automatically with the package — no Rust toolchain required. Pre-built wheels are available for Linux x86_64 and macOS (arm64/Intel) via [GitHub Releases](https://github.com/ZacharyArdern/AlphaTracer/releases).
 
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
+**Structure databases** — AlphaTracer searches against AFDB and/or ESM Atlas. Place the sequence parquet(s) in your database directory and point to it with `AT_AFDB_DIR` (or `--dbdir`):
 
-**Structure database** — AlphaTracer searches against AFDB and/or ESM Atlas. Place the sequence parquet (e.g. `afdb_v6_reps.pq`, or a merged AFDB+ESMAtlas parquet) in `~/Science/Data/AFDB/` or point to it with the `AT_AFDB_DIR` environment variable. The kmer sketch index (`.sidx`) is built automatically from the parquet on first use. If the parquet contains a `db_type` column, AlphaTracer auto-detects the merged database and queries both AFDB and ESM Atlas for structures.
+| Database | Parquet file | Notes |
+|----------|-------------|-------|
+| AFDB v6 | `afdb_v6_reps.pq` | ~91M UniRef50 representative sequences |
+| ESM Atlas | `esm_plddt60_non-afdb_reps.fasta.zst` | Non-AFDB ESM Atlas representatives |
+
+The kmer sketch index (`.sidx`) is built automatically from the parquet on first use. If the parquet contains a `db_type` column, AlphaTracer auto-detects a merged database and queries both AFDB and ESM Atlas for structures.
 
 ---
 
@@ -126,6 +129,12 @@ Core: `polars`, `numpy`, `scipy`, `parasail`, `gemmi`, `igraph`, `openmm`, `aioh
 Backend-specific: `mlx` + `minifold-mlx` (Apple Silicon) or `torch` + `fair-esm` (Linux/cloud)
 
 Optional: [ProMod3](https://openstructure.org/promod3/) for fragment-database loop closing (`--loop-closer promod3`); [DIAMOND](https://github.com/bbuchfink/diamond) for BLASTP-based Class A search (`--diamond`).
+
+---
+
+## Database setup
+
+Scripts for building the AFDB and ESM Atlas databases from scratch are in `alphatracer/scripts/setup/`. These are intended for database maintainers, not end users. See the [database setup wiki page](https://github.com/ZacharyArdern/AlphaTracer/wiki/database-setup) for instructions.
 
 ---
 

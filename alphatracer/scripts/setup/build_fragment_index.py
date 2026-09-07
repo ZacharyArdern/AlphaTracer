@@ -19,7 +19,7 @@ from pathlib import Path
 logging.getLogger('lance').setLevel(logging.ERROR)
 os.environ['RUST_LOG'] = 'error'
 
-OUT_DIR = Path(__file__).parent / 'folds_1B_index'
+OUT_DIR = Path(os.environ.get('AT_ESM_DIR', '.')).resolve() / 'folds_1B_index'
 OUT_DIR.mkdir(exist_ok=True)
 DB_PATH = OUT_DIR / 'fragment_index.duckdb'
 CHUNK_DIR = OUT_DIR / 'chunks'

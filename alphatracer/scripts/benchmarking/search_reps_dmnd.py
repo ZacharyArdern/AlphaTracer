@@ -39,7 +39,7 @@ REP_DIR        = GTDB_DIR / 'rep_proteomes'
 
 N_AFDB_CHUNKS  = 10
 N_ESM_CHUNKS   = 20
-SEARCH_THREADS = 128
+SEARCH_THREADS = 64
 MAKEDB_THREADS = 8
 OUTFMT         = '6 qseqid sseqid pident length qlen evalue'
 EVALUE         = '1e-10'
@@ -137,7 +137,7 @@ def stage_search():
             if hits.exists():
                 log(f'Skipping search — {hits} exists')
                 continue
-            bsub(SEARCH_THREADS, 'normal', 200,
+            bsub(SEARCH_THREADS, 'normal', 64,
                  f'search_vs_{label}_{chunk.stem}',
                  f'diamond blastp -q {ALL_REPS} -d {db} -o {hits} '
                  f'--outfmt {OUTFMT} --ultra-sensitive '

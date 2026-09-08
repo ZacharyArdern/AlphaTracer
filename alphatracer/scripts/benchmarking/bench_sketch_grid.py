@@ -58,34 +58,55 @@ def hits_path(k, scheme, n_hash):
     return HITS_DIR / f'{job_name(k, scheme, n_hash)}.tsv.gz'
 
 
-def stage_prep():
+def stage_prep(chunk_size: int = 500_000):
     if AFDB_PQ.exists():
         log(f'Skipping prep — {AFDB_PQ} already exists')
         return
     if not AFDB_FA.exists():
         sys.exit(f'ERROR: {AFDB_FA} not found')
-    log(f'Converting {AFDB_FA} -> {AFDB_PQ}...')
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    log(f'Converting {AFDB_FA} -> {AFDB_PQ} (chunk_size={chunk_size:,})...')
     t0 = time.time()
+    schema = pa.schema([('rep_AFDB_ID', pa.string()), ('sequence', pa.string())])
+    writer = None
+    total = 0
     ids, seqs = [], []
+    seq_id = None
+    buf = []
+
+    def flush():
+        nonlocal writer, total
+        batch = pa.table({'rep_AFDB_ID': ids, 'sequence': seqs}, schema=schema)
+        if writer is None:
+            writer = pq.ParquetWriter(str(AFDB_PQ), schema, compression='zstd')
+        writer.write_table(batch)
+        total += len(ids)
+        ids.clear(); seqs.clear()
+        log(f'  {total:,} sequences written ({time.time()-t0:.0f}s)')
+
     with open(AFDB_FA) as f:
-        seq_id = None
-        chunks = []
         for line in f:
             line = line.rstrip()
             if line.startswith('>'):
                 if seq_id is not None:
                     ids.append(seq_id)
-                    seqs.append(''.join(chunks))
+                    seqs.append(''.join(buf))
+                    if len(ids) >= chunk_size:
+                        flush()
                 seq_id = line[1:].split()[0]
-                chunks = []
+                buf = []
             else:
-                chunks.append(line)
+                buf.append(line)
         if seq_id is not None:
             ids.append(seq_id)
-            seqs.append(''.join(chunks))
-    df = pl.DataFrame({'rep_AFDB_ID': ids, 'sequence': seqs})
-    df.write_parquet(AFDB_PQ)
-    log(f'Done: {len(df):,} sequences -> {AFDB_PQ} ({time.time()-t0:.1f}s)')
+            seqs.append(''.join(buf))
+
+    if ids:
+        flush()
+    if writer:
+        writer.close()
+    log(f'Done: {total:,} sequences -> {AFDB_PQ} ({time.time()-t0:.1f}s)')
 
 
 def stage_submit(script_path: Path):

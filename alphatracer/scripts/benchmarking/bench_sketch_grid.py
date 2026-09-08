@@ -2,13 +2,15 @@
 """
 Build sketch indexes and search GTDB reps across a grid of k, alphabet, and n_hash.
 
-Run from AT_DBs/. AFDB parquet at ../AFDB/afdb_v6_reps.pq; query at ../GTDB/r232/all_reps.faa.
+Run from AT_DBs/. AFDB fasta at AFDBv6_uniref50_reps.fasta (cwd); query at ../GTDB/r232/all_reps.faa.
 
 Stages:
+  prep    — convert AFDBv6_uniref50_reps.fasta -> afdb_uniref50_reps.pq (run once on head node)
   submit  — submit one bsub job per (k, scheme, n_hash) combination
   run     — build index + search (called by each bsub job)
 
 Usage:
+  python bench_sketch_grid.py --stage prep
   python bench_sketch_grid.py --stage submit
   python bench_sketch_grid.py --stage run --k 9 --scheme murphy2000_5 --n-hash 256
 """
@@ -23,7 +25,8 @@ from pathlib import Path
 import polars as pl
 import alphatracer_sketch
 
-AFDB_PQ    = Path('../AFDB/afdb_v6_reps.pq')
+AFDB_FA    = Path('AFDBv6_uniref50_reps.fasta')
+AFDB_PQ    = Path('afdb_uniref50_reps.pq')
 QUERY_FA   = Path('../GTDB/r232/all_reps.faa')
 IDX_DIR    = Path('sketch_indexes')
 HITS_DIR   = Path('sketch_hits')
@@ -53,6 +56,36 @@ def idx_path(k, scheme, n_hash):
 
 def hits_path(k, scheme, n_hash):
     return HITS_DIR / f'{job_name(k, scheme, n_hash)}.tsv.gz'
+
+
+def stage_prep():
+    if AFDB_PQ.exists():
+        log(f'Skipping prep — {AFDB_PQ} already exists')
+        return
+    if not AFDB_FA.exists():
+        sys.exit(f'ERROR: {AFDB_FA} not found')
+    log(f'Converting {AFDB_FA} -> {AFDB_PQ}...')
+    t0 = time.time()
+    ids, seqs = [], []
+    with open(AFDB_FA) as f:
+        seq_id = None
+        chunks = []
+        for line in f:
+            line = line.rstrip()
+            if line.startswith('>'):
+                if seq_id is not None:
+                    ids.append(seq_id)
+                    seqs.append(''.join(chunks))
+                seq_id = line[1:].split()[0]
+                chunks = []
+            else:
+                chunks.append(line)
+        if seq_id is not None:
+            ids.append(seq_id)
+            seqs.append(''.join(chunks))
+    df = pl.DataFrame({'rep_AFDB_ID': ids, 'sequence': seqs})
+    df.write_parquet(AFDB_PQ)
+    log(f'Done: {len(df):,} sequences -> {AFDB_PQ} ({time.time()-t0:.1f}s)')
 
 
 def stage_submit(script_path: Path):
@@ -138,13 +171,15 @@ def stage_run(k: int, scheme: str, n_hash: int):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--stage', required=True, choices=['submit', 'run'])
+    parser.add_argument('--stage', required=True, choices=['prep', 'submit', 'run'])
     parser.add_argument('--k',      type=int)
     parser.add_argument('--scheme', type=str)
     parser.add_argument('--n-hash', type=int, dest='n_hash')
     args = parser.parse_args()
 
-    if args.stage == 'submit':
+    if args.stage == 'prep':
+        stage_prep()
+    elif args.stage == 'submit':
         stage_submit(Path(__file__))
     elif args.stage == 'run':
         for a, name in [(args.k, '--k'), (args.scheme, '--scheme'), (args.n_hash, '--n-hash')]:

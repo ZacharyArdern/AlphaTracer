@@ -3,19 +3,18 @@
 Evaluate recall and precision of sketch search vs diamond ground truth.
 
 Run from AT_DBs/. Loads afdb_hits_merged.tsv as ground truth, evaluates
-each sketch_hits/*.tsv.gz file, and writes a summary TSV + plots.
+each sketch_hits/*.tsv.gz file one at a time, and writes a summary TSV + plots.
+
+Recall per pident bin: fraction of diamond hits in that bin found by sketch.
+Precision overall:     fraction of sketch hits that have any diamond match.
 
 Usage:
   python eval_sketch_recall.py
   python eval_sketch_recall.py --diamond afdb_hits_merged.tsv --hits-dir sketch_hits/
 """
 import argparse
-import csv
-import gzip
 import re
 import time
-from collections import defaultdict
-from itertools import product
 from pathlib import Path
 
 import polars as pl
@@ -25,90 +24,121 @@ HITS_DIR    = Path('sketch_hits')
 OUT_TSV     = Path('sketch_eval_results.tsv')
 OUT_PLOT    = Path('sketch_eval_plots.png')
 
+EVALUE_MAX  = 1e-10
 PIDENT_BINS = [(30, 40), (40, 50), (50, 60), (60, 101)]
 BIN_LABELS  = ['30-40%', '40-50%', '50-60%', '60%+']
-EVALUE_MAX  = 1e-10
 
 
 def log(msg):
     print(f'[{time.strftime("%H:%M:%S")}] {msg}', flush=True)
 
 
-def load_diamond(path: Path) -> dict[str, set]:
-    """Load diamond hits into dict: bin_label -> set of (query, target) pairs."""
+def load_diamond(path: Path) -> pl.DataFrame:
     log(f'Loading diamond ground truth from {path}...')
-    gt = {label: set() for label in BIN_LABELS}
-    n = 0
-    with open(path) as f:
-        for line in f:
-            parts = line.rstrip('\n').split('\t')
-            if len(parts) < 6:
-                continue
-            query, target, pident, _, _, evalue = parts[:6]
-            try:
-                pident = float(pident)
-                evalue = float(evalue)
-            except ValueError:
-                continue
-            if evalue > EVALUE_MAX:
-                continue
-            for (lo, hi), label in zip(PIDENT_BINS, BIN_LABELS):
-                if lo <= pident < hi:
-                    gt[label].add((query, target))
-                    n += 1
-                    break
+    df = (
+        pl.read_csv(path, separator='\t', has_header=False,
+                    new_columns=['query', 'target', 'pident', 'length', 'qlen', 'evalue'],
+                    schema_overrides={'pident': pl.Float32, 'evalue': pl.Float64})
+        .filter(pl.col('evalue') <= EVALUE_MAX)
+        .filter(pl.col('pident') >= 30)
+        .select(['query', 'target', 'pident'])
+        .with_columns(
+            pl.when(pl.col('pident').is_between(30, 40, closed='left')).then(pl.lit('30-40%'))
+            .when(pl.col('pident').is_between(40, 50, closed='left')).then(pl.lit('40-50%'))
+            .when(pl.col('pident').is_between(50, 60, closed='left')).then(pl.lit('50-60%'))
+            .otherwise(pl.lit('60%+'))
+            .alias('pident_bin')
+        )
+    )
     for label in BIN_LABELS:
-        log(f'  {label}: {len(gt[label]):,} ground-truth pairs')
-    log(f'  Total: {n:,} pairs across all bins')
-    return gt
+        n = df.filter(pl.col('pident_bin') == label).height
+        log(f'  {label}: {n:,} ground-truth pairs')
+    log(f'  Total: {df.height:,} pairs')
+    return df
 
 
-def eval_sketch_file(path: Path, gt: dict[str, set]) -> dict | None:
-    """Compute recall and precision per pident bin for one sketch hits file."""
-    m = re.search(r'k(\d+)_(murphy\d+|dayhoff\w+)_n(\d+)', path.stem)
+def parse_job_name(stem: str) -> tuple | None:
+    m = re.search(r'k(\d+)_(murphy\w+|dayhoff\w+)_n(\d+)', stem)
     if not m:
         return None
-    k, scheme, n_hash = int(m.group(1)), m.group(2), int(m.group(3))
+    return int(m.group(1)), m.group(2), int(m.group(3))
 
-    sketch_pairs = set()
+
+def eval_one(path: Path, diamond: pl.DataFrame,
+             diamond_all_pairs: pl.DataFrame) -> dict | None:
+    params = parse_job_name(path.stem)
+    if params is None:
+        return None
+    k, scheme, n_hash = params
+
     try:
-        with gzip.open(path, 'rt') as f:
-            reader = csv.DictReader(f, delimiter='\t')
-            for row in reader:
-                sketch_pairs.add((row['query_id'], row['target_id']))
+        sketch = pl.read_csv(path, separator='\t', has_header=True,
+                             schema_overrides={'n_shared': pl.UInt32,
+                                              'containment': pl.Float32})
     except Exception as e:
-        log(f'  WARNING: could not read {path}: {e}')
+        log(f'  WARNING: could not read {path.name}: {e}')
         return None
 
-    row_out = {'k': k, 'scheme': scheme, 'n_hash': n_hash,
-               'n_sketch_total': len(sketch_pairs)}
-    for label, (lo, hi) in zip(BIN_LABELS, PIDENT_BINS):
-        gt_bin = gt[label]
-        tp = len(sketch_pairs & gt_bin)
-        fn = len(gt_bin) - tp
-        fp = len(sketch_pairs) - tp  # all sketch hits not in this gt bin
-        recall    = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        row_out[f'recall_{label}']    = round(recall, 4)
-        row_out[f'precision_{label}'] = round(precision, 4)
-        row_out[f'n_gt_{label}']      = len(gt_bin)
-        row_out[f'n_tp_{label}']      = tp
-    return row_out
+    n_sketch = sketch.height
+    if n_sketch == 0:
+        return None
+
+    # ── Recall: join diamond (ground truth) against sketch hits ──────────────
+    # Left join keeps all diamond rows; mark which were found by sketch
+    recall_df = (
+        diamond
+        .join(
+            sketch.select(['query_id', 'target_id'])
+                  .with_columns(pl.lit(True).alias('found')),
+            left_on=['query', 'target'],
+            right_on=['query_id', 'target_id'],
+            how='left'
+        )
+        .with_columns(pl.col('found').fill_null(False))
+        .group_by('pident_bin')
+        .agg([
+            pl.len().alias('n_gt'),
+            pl.col('found').sum().alias('n_tp'),
+        ])
+        .with_columns((pl.col('n_tp') / pl.col('n_gt')).alias('recall'))
+    )
+
+    # ── Precision: join sketch hits against all diamond pairs ────────────────
+    n_tp_total = (
+        sketch
+        .join(diamond_all_pairs, left_on=['query_id', 'target_id'],
+              right_on=['query', 'target'], how='semi')
+        .height
+    )
+    precision_overall = n_tp_total / n_sketch
+
+    # ── Collect results ───────────────────────────────────────────────────────
+    row = {'k': k, 'scheme': scheme, 'n_hash': n_hash,
+           'n_sketch': n_sketch, 'precision_overall': round(precision_overall, 4)}
+
+    recall_map = {r['pident_bin']: r for r in recall_df.to_dicts()}
+    for label in BIN_LABELS:
+        r = recall_map.get(label, {})
+        row[f'recall_{label}']  = round(r.get('recall', 0.0), 4)
+        row[f'n_gt_{label}']    = r.get('n_gt', 0)
+        row[f'n_tp_{label}']    = r.get('n_tp', 0)
+
+    del sketch
+    return row
 
 
 def make_plots(df: pl.DataFrame, out_path: Path):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    import numpy as np
 
-    schemes = df['scheme'].unique().sort().to_list()
+    schemes  = sorted(df['scheme'].unique().to_list())
     n_hashes = sorted(df['n_hash'].unique().to_list())
-    colors = plt.cm.tab10.colors
+    colors   = plt.cm.tab10.colors
+    styles   = ['-', '--', ':', '-.']
 
-    fig, axes = plt.subplots(len(BIN_LABELS), 2,
-                             figsize=(14, 4 * len(BIN_LABELS)),
-                             squeeze=False)
+    n_rows = len(BIN_LABELS) + 1  # extra row for precision
+    fig, axes = plt.subplots(n_rows, 2, figsize=(14, 4 * n_rows), squeeze=False)
 
     for row_i, label in enumerate(BIN_LABELS):
         ax_rec  = axes[row_i][0]
@@ -122,27 +152,40 @@ def make_plots(df: pl.DataFrame, out_path: Path):
                     continue
                 ks      = sub['k'].to_list()
                 recalls = sub[f'recall_{label}'].to_list()
-                precs   = sub[f'precision_{label}'].to_list()
+                precs   = sub['precision_overall'].to_list()
                 lbl = f'{scheme} n={n_hash}'
-                ls  = ['-', '--', ':', '-.'][ni]
-                c   = colors[si % len(colors)]
-                ax_rec.plot(ks, recalls, linestyle=ls, color=c, label=lbl, marker='o', ms=3)
-                ax_prec.plot(ks, precs,  linestyle=ls, color=c, label=lbl, marker='o', ms=3)
+                c, ls = colors[si % len(colors)], styles[ni % len(styles)]
+                ax_rec.plot(ks,  recalls, linestyle=ls, color=c, label=lbl, marker='o', ms=3)
+                ax_prec.plot(ks, precs,   linestyle=ls, color=c, label=lbl, marker='o', ms=3)
 
         ax_rec.set_title(f'Recall — pident {label}')
         ax_rec.set_xlabel('k'); ax_rec.set_ylabel('Recall')
-        ax_rec.set_ylim(0, 1.05); ax_rec.set_xticks(range(6, 16))
-        ax_rec.grid(True, alpha=0.3)
-
-        ax_prec.set_title(f'Precision — pident {label}')
+        ax_rec.set_ylim(0, 1.05); ax_rec.set_xticks(range(6, 16)); ax_rec.grid(True, alpha=0.3)
+        ax_prec.set_title(f'Precision (overall) at pident {label}')
         ax_prec.set_xlabel('k'); ax_prec.set_ylabel('Precision')
-        ax_prec.set_ylim(0, 1.05); ax_prec.set_xticks(range(6, 16))
-        ax_prec.grid(True, alpha=0.3)
+        ax_prec.set_ylim(0, 1.05); ax_prec.set_xticks(range(6, 16)); ax_prec.grid(True, alpha=0.3)
+
+    # Bottom row: precision only
+    ax_p = axes[len(BIN_LABELS)][0]
+    for si, scheme in enumerate(schemes):
+        for ni, n_hash in enumerate(n_hashes):
+            sub = df.filter(
+                (pl.col('scheme') == scheme) & (pl.col('n_hash') == n_hash)
+            ).sort('k')
+            if sub.is_empty():
+                continue
+            ax_p.plot(sub['k'].to_list(), sub['precision_overall'].to_list(),
+                      linestyle=styles[ni % len(styles)], color=colors[si % len(colors)],
+                      label=f'{scheme} n={n_hash}', marker='o', ms=3)
+    ax_p.set_title('Precision overall (any diamond match)')
+    ax_p.set_xlabel('k'); ax_p.set_ylabel('Precision')
+    ax_p.set_ylim(0, 1.05); ax_p.set_xticks(range(6, 16)); ax_p.grid(True, alpha=0.3)
+    axes[len(BIN_LABELS)][1].set_visible(False)
 
     handles, labels = axes[0][0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='lower center', ncol=4,
-               bbox_to_anchor=(0.5, -0.02), fontsize=8)
-    plt.tight_layout(rect=[0, 0.04, 1, 1])
+               bbox_to_anchor=(0.5, -0.01), fontsize=8)
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     log(f'Plot saved -> {out_path}')
 
@@ -160,16 +203,17 @@ def main():
     if not args.diamond.exists():
         raise SystemExit(f'ERROR: {args.diamond} not found')
 
-    gt = load_diamond(args.diamond)
+    diamond = load_diamond(args.diamond)
+    diamond_all_pairs = diamond.select(['query', 'target']).unique()
 
     hits_files = sorted(args.hits_dir.glob('*.tsv.gz'))
     if not hits_files:
-        raise SystemExit(f'ERROR: no .tsv.gz files found in {args.hits_dir}')
-    log(f'Evaluating {len(hits_files)} sketch result files...')
+        raise SystemExit(f'ERROR: no .tsv.gz files in {args.hits_dir}')
+    log(f'Evaluating {len(hits_files)} sketch files...')
 
     results = []
     for i, path in enumerate(hits_files):
-        row = eval_sketch_file(path, gt)
+        row = eval_one(path, diamond, diamond_all_pairs)
         if row:
             results.append(row)
         if (i + 1) % 20 == 0:
@@ -177,13 +221,13 @@ def main():
 
     df = pl.DataFrame(results).sort(['scheme', 'k', 'n_hash'])
     df.write_csv(args.out, separator='\t')
-    log(f'Results written -> {args.out} ({len(df)} rows)')
+    log(f'Results -> {args.out} ({len(df)} rows)')
 
     if not args.no_plot:
         try:
             make_plots(df, args.plot)
         except ImportError:
-            log('matplotlib not available — skipping plots')
+            log('matplotlib not available — skipping plots (pip install matplotlib)')
 
 
 if __name__ == '__main__':

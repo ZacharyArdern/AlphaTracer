@@ -15,7 +15,7 @@ The query has a high-confidence AFDB or ESM Atlas hit: no insertions or deletion
 The query has an AFDB or ESM Atlas hit with 1–3 small indels (up to 5 residues each) and >30% overall identity. Matched positions are grafted from the reference; inserted residues are placed in an extended conformation; gaps are closed with Cyclic Coordinate Descent (CCD); and the result is refined by OpenMM minimisation.
 
 ### Class C — Domain-level template matching
-No full-length hit qualifies, but the reference structure can be decomposed into rigid domains (via PAE graph clustering). Domains with ≥50% sequence identity to the query are grafted individually. Remaining query regions can optionally be filled in using MiniFold predictions, placed by L-BFGS-B, and closed with CCD.
+No full-length hit qualifies, but the reference structure can be decomposed into rigid domains (via PAE graph clustering). Domains with ≥40% sequence identity to the query are grafted individually. Remaining query regions can optionally be filled in using MiniFold predictions, placed by L-BFGS-B, and closed with CCD.
 
 ### Class D — De novo prediction
 No suitable homology exists. The full sequence is predicted by MiniFold (MLX backend on Apple Silicon; PyTorch on Linux/cloud), with up to two recycling rounds if mean pLDDT < 85. Sequences longer than 800 residues are skipped by default due to memory limits.

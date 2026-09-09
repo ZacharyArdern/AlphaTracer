@@ -20,11 +20,13 @@ from pathlib import Path
 import polars as pl
 
 DIAMOND_TSV = Path('afdb_hits_merged.tsv')
+DIAMOND_PQ  = Path('afdb_hits_filtered.pq')
 HITS_DIR    = Path('sketch_hits')
 OUT_TSV     = Path('sketch_eval_results.tsv')
 OUT_PLOT    = Path('sketch_eval_plots.png')
 
 EVALUE_MAX  = 1e-10
+MIN_ALN_LEN = 40
 PIDENT_BINS = [(30, 40), (40, 50), (50, 60), (60, 101)]
 BIN_LABELS  = ['30-40%', '40-50%', '50-60%', '60%+']
 
@@ -33,14 +35,21 @@ def log(msg):
     print(f'[{time.strftime("%H:%M:%S")}] {msg}', flush=True)
 
 
-def load_diamond(path: Path) -> pl.DataFrame:
-    log(f'Loading diamond ground truth from {path}...')
-    df = (
-        pl.read_csv(path, separator='\t', has_header=False,
+def prep_diamond(tsv_path: Path, pq_path: Path) -> None:
+    """Stream diamond TSV, filter, and write compact parquet. Skipped if parquet exists."""
+    if pq_path.exists():
+        log(f'Skipping diamond prep — {pq_path} already exists')
+        return
+    log(f'Filtering {tsv_path} -> {pq_path} (streaming, may take a while)...')
+    t0 = time.time()
+    (
+        pl.scan_csv(tsv_path, separator='\t', has_header=False,
                     new_columns=['query', 'target', 'pident', 'length', 'qlen', 'evalue'],
-                    schema_overrides={'pident': pl.Float32, 'evalue': pl.Float64})
+                    schema_overrides={'pident': pl.Float32, 'length': pl.Int32,
+                                      'evalue': pl.Float64})
         .filter(pl.col('evalue') <= EVALUE_MAX)
         .filter(pl.col('pident') >= 30)
+        .filter(pl.col('length') >= MIN_ALN_LEN)
         .select(['query', 'target', 'pident'])
         .with_columns(
             pl.when(pl.col('pident').is_between(30, 40, closed='left')).then(pl.lit('30-40%'))
@@ -49,7 +58,14 @@ def load_diamond(path: Path) -> pl.DataFrame:
             .otherwise(pl.lit('60%+'))
             .alias('pident_bin')
         )
+        .sink_parquet(pq_path, compression='zstd')
     )
+    log(f'Done in {time.time()-t0:.1f}s -> {pq_path}')
+
+
+def load_diamond(pq_path: Path) -> pl.DataFrame:
+    log(f'Loading diamond ground truth from {pq_path}...')
+    df = pl.read_parquet(pq_path)
     for label in BIN_LABELS:
         n = df.filter(pl.col('pident_bin') == label).height
         log(f'  {label}: {n:,} ground-truth pairs')
@@ -200,10 +216,12 @@ def main():
     parser.add_argument('--no-plot',  action='store_true')
     args = parser.parse_args()
 
-    if not args.diamond.exists():
+    if not args.diamond.exists() and not DIAMOND_PQ.exists():
         raise SystemExit(f'ERROR: {args.diamond} not found')
 
-    diamond = load_diamond(args.diamond)
+    if args.diamond.exists():
+        prep_diamond(args.diamond, DIAMOND_PQ)
+    diamond = load_diamond(DIAMOND_PQ)
     diamond_all_pairs = diamond.select(['query', 'target']).unique()
 
     hits_files = sorted(args.hits_dir.glob('*.tsv.gz'))

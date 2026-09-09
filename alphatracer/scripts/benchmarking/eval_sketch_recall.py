@@ -99,24 +99,25 @@ def eval_one(path: Path, diamond_pq: Path) -> dict | None:
     k, scheme, n_hash = params
 
     try:
-        sketch = pl.read_csv(path, separator='\t', has_header=True,
-                             schema_overrides={'n_shared': pl.UInt32,
-                                              'containment': pl.Float32})
+        # Scan lazily — never load the full sketch file into RAM
+        sketch_lazy = pl.scan_csv(path, separator='\t', has_header=True,
+                                  schema_overrides={'n_shared': pl.UInt32,
+                                                    'containment': pl.Float32})
+        n_sketch = sketch_lazy.select(pl.len()).collect(streaming=True)[0, 0]
     except Exception as e:
         log(f'  WARNING: could not read {path.name}: {e}')
         return None
 
-    n_sketch = sketch.height
     if n_sketch == 0:
         return None
 
-    sketch_pairs = sketch.select(['query_id', 'target_id'])
+    sketch_pairs = sketch_lazy.select(['query_id', 'target_id'])
 
     # ── Recall: lazy join diamond against sketch, aggregate only ─────────────
     recall_df = (
         pl.scan_parquet(diamond_pq)
         .join(
-            sketch_pairs.lazy().with_columns(pl.lit(True).alias('found')),
+            sketch_pairs.with_columns(pl.lit(True).alias('found')),
             left_on=['query', 'target'],
             right_on=['query_id', 'target_id'],
             how='left'
@@ -130,7 +131,7 @@ def eval_one(path: Path, diamond_pq: Path) -> dict | None:
 
     # ── Precision: lazy semi-join sketch against diamond ─────────────────────
     n_tp_total = (
-        sketch_pairs.lazy()
+        sketch_pairs
         .join(pl.scan_parquet(diamond_pq).select(['query', 'target']),
               left_on=['query_id', 'target_id'],
               right_on=['query', 'target'],
@@ -151,7 +152,6 @@ def eval_one(path: Path, diamond_pq: Path) -> dict | None:
         row[f'n_gt_{label}']    = r.get('n_gt', 0)
         row[f'n_tp_{label}']    = r.get('n_tp', 0)
 
-    del sketch
     return row
 
 

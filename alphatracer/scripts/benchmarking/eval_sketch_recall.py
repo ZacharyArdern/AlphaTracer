@@ -63,14 +63,20 @@ def prep_diamond(tsv_path: Path, pq_path: Path) -> None:
     log(f'Done in {time.time()-t0:.1f}s -> {pq_path}')
 
 
-def load_diamond(pq_path: Path) -> pl.DataFrame:
-    log(f'Loading diamond ground truth from {pq_path}...')
-    df = pl.read_parquet(pq_path)
-    for label in BIN_LABELS:
-        n = df.filter(pl.col('pident_bin') == label).height
-        log(f'  {label}: {n:,} ground-truth pairs')
-    log(f'  Total: {df.height:,} pairs')
-    return df
+def log_diamond_counts(pq_path: Path) -> None:
+    log(f'Diamond ground truth counts from {pq_path}:')
+    counts = (
+        pl.scan_parquet(pq_path)
+        .group_by('pident_bin')
+        .agg(pl.len().alias('n'))
+        .collect()
+        .sort('pident_bin')
+    )
+    total = 0
+    for row in counts.to_dicts():
+        log(f'  {row["pident_bin"]}: {row["n"]:,}')
+        total += row['n']
+    log(f'  Total: {total:,}')
 
 
 def parse_job_name(stem: str) -> tuple | None:
@@ -80,8 +86,7 @@ def parse_job_name(stem: str) -> tuple | None:
     return int(m.group(1)), m.group(2), int(m.group(3))
 
 
-def eval_one(path: Path, diamond: pl.DataFrame,
-             diamond_all_pairs: pl.DataFrame) -> dict | None:
+def eval_one(path: Path, diamond_pq: Path) -> dict | None:
     params = parse_job_name(path.stem)
     if params is None:
         return None
@@ -99,31 +104,32 @@ def eval_one(path: Path, diamond: pl.DataFrame,
     if n_sketch == 0:
         return None
 
-    # ── Recall: join diamond (ground truth) against sketch hits ──────────────
-    # Left join keeps all diamond rows; mark which were found by sketch
+    sketch_pairs = sketch.select(['query_id', 'target_id'])
+
+    # ── Recall: lazy join diamond against sketch, aggregate only ─────────────
     recall_df = (
-        diamond
+        pl.scan_parquet(diamond_pq)
         .join(
-            sketch.select(['query_id', 'target_id'])
-                  .with_columns(pl.lit(True).alias('found')),
+            sketch_pairs.lazy().with_columns(pl.lit(True).alias('found')),
             left_on=['query', 'target'],
             right_on=['query_id', 'target_id'],
             how='left'
         )
         .with_columns(pl.col('found').fill_null(False))
         .group_by('pident_bin')
-        .agg([
-            pl.len().alias('n_gt'),
-            pl.col('found').sum().alias('n_tp'),
-        ])
+        .agg([pl.len().alias('n_gt'), pl.col('found').sum().alias('n_tp')])
         .with_columns((pl.col('n_tp') / pl.col('n_gt')).alias('recall'))
+        .collect(streaming=True)
     )
 
-    # ── Precision: join sketch hits against all diamond pairs ────────────────
+    # ── Precision: lazy semi-join sketch against diamond ─────────────────────
     n_tp_total = (
-        sketch
-        .join(diamond_all_pairs, left_on=['query_id', 'target_id'],
-              right_on=['query', 'target'], how='semi')
+        sketch_pairs.lazy()
+        .join(pl.scan_parquet(diamond_pq).select(['query', 'target']),
+              left_on=['query_id', 'target_id'],
+              right_on=['query', 'target'],
+              how='semi')
+        .collect(streaming=True)
         .height
     )
     precision_overall = n_tp_total / n_sketch
@@ -221,8 +227,7 @@ def main():
 
     if args.diamond.exists():
         prep_diamond(args.diamond, DIAMOND_PQ)
-    diamond = load_diamond(DIAMOND_PQ)
-    diamond_all_pairs = diamond.select(['query', 'target']).unique()
+    log_diamond_counts(DIAMOND_PQ)
 
     hits_files = sorted(args.hits_dir.glob('*.tsv.gz'))
     if not hits_files:
@@ -231,7 +236,7 @@ def main():
 
     results = []
     for i, path in enumerate(hits_files):
-        row = eval_one(path, diamond, diamond_all_pairs)
+        row = eval_one(path, DIAMOND_PQ)
         if row:
             results.append(row)
         if (i + 1) % 20 == 0:

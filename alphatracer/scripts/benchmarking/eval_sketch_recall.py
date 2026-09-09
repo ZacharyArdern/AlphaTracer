@@ -113,9 +113,20 @@ def eval_one(path: Path, diamond_pq: Path) -> dict | None:
 
     sketch_pairs = sketch_lazy.select(['query_id', 'target_id'])
 
-    # ── Recall: lazy join diamond against sketch, aggregate only ─────────────
-    recall_df = (
+    # Collect unique query IDs from sketch (small — just query names, not all pairs)
+    query_ids = (sketch_lazy.select('query_id').unique()
+                 .collect(streaming=True)['query_id'])
+
+    # Pre-filter diamond to only the queries present in this sketch file — avoids
+    # joining 1.267B rows when most belong to unrelated queries
+    diamond_for_sketch = (
         pl.scan_parquet(diamond_pq)
+        .filter(pl.col('query').is_in(query_ids))
+    )
+
+    # ── Recall: lazy join filtered diamond against sketch, aggregate only ─────
+    recall_df = (
+        diamond_for_sketch
         .join(
             sketch_pairs.with_columns(pl.lit(True).alias('found')),
             left_on=['query', 'target'],
@@ -129,10 +140,10 @@ def eval_one(path: Path, diamond_pq: Path) -> dict | None:
         .collect(streaming=True)
     )
 
-    # ── Precision: lazy semi-join sketch against diamond ─────────────────────
+    # ── Precision: lazy semi-join sketch against filtered diamond ─────────────
     n_tp_total = (
         sketch_pairs
-        .join(pl.scan_parquet(diamond_pq).select(['query', 'target']),
+        .join(diamond_for_sketch.select(['query', 'target']),
               left_on=['query_id', 'target_id'],
               right_on=['query', 'target'],
               how='semi')

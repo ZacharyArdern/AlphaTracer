@@ -75,7 +75,7 @@ def log_diamond_counts(pq_path: Path) -> None:
         pl.scan_parquet(pq_path)
         .group_by('pident_bin')
         .agg(pl.len().alias('n'))
-        .collect()
+        .collect(streaming=True)
         .sort('pident_bin')
     )
     total = 0

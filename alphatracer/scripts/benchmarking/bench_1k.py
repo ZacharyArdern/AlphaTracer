@@ -3,19 +3,14 @@
 Benchmark 1000 random queries: all sketch param combos (top_k=500) + diamond --fast,
 evaluated against diamond ultra-sensitive top-500 ground truth.
 
-Run from AT_DBs/.
-
-Stages (run in order):
-  prep    — extract 1000 random queries from all_reps.faa + build ground truth parquet
-  sketch  — search all existing .sidx indexes with top_k=500 (reuses built indexes)
-  diamond — submit bsub diamond --fast job against afdb_uniref50_reps_db.dmnd
-  eval    — compare all methods against ground truth, write eval_1k_results.tsv
+Run from AT_DBs/. Runs all stages sequentially in one job.
 
 Usage:
-  python bench_1k.py --stage prep
-  python bench_1k.py --stage sketch
-  python bench_1k.py --stage diamond
-  python bench_1k.py --stage eval
+  python bench_1k.py
+  python bench_1k.py --stage prep   # run a single stage only
+
+Recommended bsub submission (32 threads, 64 GB):
+  bsub.py --threads 32 -q normal 64 bench_1k.log "bash -c 'export PYTHONPATH=~/.local/lib/polars:\$PYTHONPATH && python bench_1k.py'"
 """
 import argparse
 import re
@@ -170,9 +165,10 @@ def stage_diamond():
         f'--fast --max-target-seqs {TOP_K} --evalue {EVALUE_MAX} --min-score 0 '
         f'--threads {DMND_THREADS}'
     )
-    bsub = f'bsub.py --threads {DMND_THREADS} -q normal {DMND_MEM_GB} diamond_fast_1k.log "{cmd}"'
-    log(f'Submitting: {bsub}')
-    subprocess.run(bsub, shell=True, check=True)
+    log(f'Running: {cmd}')
+    t0 = time.time()
+    subprocess.run(cmd, shell=True, check=True)
+    log(f'Diamond done in {time.time()-t0:.1f}s -> {DMND_FAST_TSV}')
 
 
 # ── eval ──────────────────────────────────────────────────────────────────────
@@ -267,13 +263,20 @@ def stage_eval():
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--stage', required=True, choices=['prep', 'sketch', 'diamond', 'eval'])
+    parser.add_argument('--stage', choices=['prep', 'sketch', 'diamond', 'eval'],
+                        help='Run a single stage only (default: run all stages)')
     args = parser.parse_args()
 
-    if   args.stage == 'prep':    stage_prep()
-    elif args.stage == 'sketch':  stage_sketch()
-    elif args.stage == 'diamond': stage_diamond()
-    elif args.stage == 'eval':    stage_eval()
+    if args.stage:
+        if   args.stage == 'prep':    stage_prep()
+        elif args.stage == 'sketch':  stage_sketch()
+        elif args.stage == 'diamond': stage_diamond()
+        elif args.stage == 'eval':    stage_eval()
+    else:
+        stage_prep()
+        stage_sketch()
+        stage_diamond()
+        stage_eval()
 
 
 if __name__ == '__main__':

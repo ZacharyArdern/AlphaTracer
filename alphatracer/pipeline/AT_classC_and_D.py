@@ -496,32 +496,39 @@ def _fast_relax_gap_regions(residues, gap_sites, n_flank=5, n_steps=60,
     Replaces OpenMM for Class C: ~5–15 ms vs ~500 ms.
     """
     n_res = len(residues)
-    mobile: set[int] = set()
+    mobile_set: set[int] = set()
     for gs in gap_sites:
         gbr = gs if isinstance(gs, int) else gs[0]
         for ri in range(max(0, gbr - n_flank), min(n_res, gbr + n_flank + 2)):
-            mobile.add(ri)
-    if not mobile:
+            mobile_set.add(ri)
+    if not mobile_set:
         return
 
-    ca_pos = np.array(
-        [np.asarray(res['atoms'].get('CA', [0.0, 0.0, 0.0]), dtype=np.float64)
-         for res in residues])
-    mobile_mask = np.array([ri in mobile for ri in range(n_res)])
-    ri_arr      = np.arange(n_res)
+    mobile_idx = np.array(sorted(mobile_set), dtype=np.int32)   # (m,)
+    all_idx    = np.arange(n_res, dtype=np.int32)
+
+    # Build CA position arrays: all residues (for force sources) + mobile subset
+    all_ca  = np.array(
+        [np.asarray(residues[ri]['atoms'].get('CA', [0.0, 0.0, 0.0]), dtype=np.float64)
+         for ri in range(n_res)])                                 # (n,3)
+    orig_ca = all_ca[mobile_idx].copy()                           # (m,3) — original positions
+    mob_ca  = orig_ca.copy()                                      # (m,3) — evolves each step
+    # seq_sep is constant; precompute outside the loop
+    seq_sep = np.abs(mobile_idx[:, None] - all_idx[None, :])     # (m, n)
 
     for _ in range(n_steps):
-        diff    = ca_pos[:, None, :] - ca_pos[None, :, :]   # (n,n,3)
-        dist    = np.sqrt((diff * diff).sum(-1) + 1e-9)      # (n,n)
-        seq_sep = np.abs(ri_arr[:, None] - ri_arr[None, :])  # (n,n)
-        overlap = np.where((seq_sep > 2) & (dist < clash_dist), clash_dist - dist, 0.0)
-        force   = (k_rep * overlap[..., None] / dist[..., None] * diff).sum(1)  # (n,3)
-        ca_pos[mobile_mask] += step_size * force[mobile_mask]
-
-    for ri in mobile:
+        # Sync mobile positions into all_ca so fixed↔mobile distances are current
+        all_ca[mobile_idx] = mob_ca
+        diff    = mob_ca[:, None, :] - all_ca[None, :, :]        # (m, n, 3)
+        dist    = np.sqrt((diff * diff).sum(-1) + 1e-9)           # (m, n)
+        overlap = np.where((seq_sep > 2) & (dist < clash_dist),
+                           clash_dist - dist, 0.0)                # (m, n)
+        force   = (k_rep * overlap[..., None] / dist[..., None] * diff).sum(1)  # (m,3)
+        mob_ca += step_size * force
+    for i, ri in enumerate(mobile_idx):
         if 'CA' not in residues[ri]['atoms']:
             continue
-        delta = ca_pos[ri] - np.asarray(residues[ri]['atoms']['CA'], dtype=np.float64)
+        delta = mob_ca[i] - orig_ca[i]
         if np.linalg.norm(delta) < 1e-6:
             continue
         for aname in list(residues[ri]['atoms']):

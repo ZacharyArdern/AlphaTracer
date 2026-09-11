@@ -22,18 +22,45 @@ This avoids any runtime coupling between the two libraries.
 """
 import os
 import tempfile
+import threading
 import time
 import numpy as np
 from pathlib import Path
 
 BACKEND_CCD     = "ccd"
 BACKEND_PROMOD3 = "promod3"
+BACKEND_KIC     = "kic"
 
 # ── Lazy ProMod3 globals (loaded once per process) ────────────────────────────
 _pm3_loaded    = False
 _frag_db       = None
 _structure_db  = None
 _torsion_sampler = None
+
+# ── Lazy native KIC globals ───────────────────────────────────────────────────
+_native_frag_db = None
+_native_lock    = threading.Lock()
+
+
+def _load_native():
+    """Load the native fragment DB (once per process, thread-safe)."""
+    global _native_frag_db
+    if _native_frag_db is not None:
+        return
+    with _native_lock:
+        if _native_frag_db is not None:  # double-checked locking
+            return
+        from alphatracer.utils.frag_db import load as _load_fdb
+        data_dir = Path(__file__).parent.parent / 'data'
+        for name in ('fragdb_local.npz', 'fragdb.npz'):
+            p = data_dir / name
+            if p.exists():
+                _native_frag_db = _load_fdb(str(p))
+                return
+        raise FileNotFoundError(
+            f"Native fragment DB not found in {data_dir}. "
+            "Run scripts/setup/dump_fragdb.py to generate it."
+        )
 
 
 def _load_promod3():
@@ -193,6 +220,100 @@ def close_gap_promod3(gemmi_st, chain_id, n_stem_seqid, c_stem_seqid,
     return filled_st, None if gaps_remaining == 0 else f"{gaps_remaining} gap(s) unclosed"
 
 
+# ── Native KIC loop closer ────────────────────────────────────────────────────
+
+def close_gap_kic(residues: list, gap_sites: list) -> list:
+    """
+    Close insertion gaps using the native fragment DB + analytical KIC.
+    No Docker or ProMod3 required.
+
+    For each insertion gap_site, queries the fragment DB for candidates
+    matching the stem-pair geometry, then applies analytical KIC to close
+    each candidate to the C-terminal stem. The first successfully closed
+    fragment replaces the CCD-placed residue backbone in `residues`.
+
+    Parameters
+    ----------
+    residues  : list of residue dicts (modified in place)
+    gap_sites : list of (gap_before_ri, gap_type, loop_len) 3-tuples
+
+    Returns
+    -------
+    List of (gap_before_ri, closed: bool) for each insertion gap attempted.
+    """
+    from alphatracer.utils.kic import close_loop as _kic_close
+
+    _load_native()
+    db = _native_frag_db
+
+    results = []
+    for (gap_before_ri, gap_type, loop_len) in gap_sites:
+        if gap_type != 'insertion' or loop_len < 3:
+            continue
+
+        n_stem_ri = gap_before_ri
+        loop_start = gap_before_ri + 1
+        loop_end   = gap_before_ri + loop_len      # inclusive
+        c_stem_ri  = gap_before_ri + loop_len + 1
+
+        if c_stem_ri >= len(residues):
+            results.append((gap_before_ri, False))
+            continue
+
+        n_atoms = residues[n_stem_ri]['atoms']
+        c_atoms = residues[c_stem_ri]['atoms']
+        if not all(k in n_atoms for k in ('N', 'CA', 'C')):
+            results.append((gap_before_ri, False))
+            continue
+        if not all(k in c_atoms for k in ('N', 'CA', 'C')):
+            results.append((gap_before_ri, False))
+            continue
+
+        n_stem_N  = np.array(n_atoms['N'],  float)
+        n_stem_CA = np.array(n_atoms['CA'], float)
+        n_stem_C  = np.array(n_atoms['C'],  float)
+        c_stem_N  = np.array(c_atoms['N'],  float)
+        c_stem_CA = np.array(c_atoms['CA'], float)
+        c_stem_C  = np.array(c_atoms['C'],  float)
+
+        # Query fragment DB — candidates already in absolute coords at n_stem
+        frag_coords, _ = db.query(
+            n_stem_N, n_stem_CA, n_stem_C,
+            c_stem_N, c_stem_CA, c_stem_C,
+            frag_len=loop_len, extra_bins=1,
+        )
+
+        if len(frag_coords) == 0:
+            results.append((gap_before_ri, False))
+            continue
+
+        # Try candidates through analytical KIC until one closes
+        closed = None
+        for frag in frag_coords:
+            sol = _kic_close(
+                frag,
+                n_stem_N, n_stem_CA, n_stem_C,
+                c_stem_N, c_stem_CA, c_stem_C,
+            )
+            if sol is not None:
+                closed = sol
+                break
+
+        if closed is None:
+            results.append((gap_before_ri, False))
+            continue
+
+        # Write closed backbone into residues
+        ATOM_NAMES = ('N', 'CA', 'C', 'O')
+        for j, ri in enumerate(range(loop_start, loop_end + 1)):
+            for k, aname in enumerate(ATOM_NAMES):
+                residues[ri]['atoms'][aname] = closed[j, k].tolist()
+
+        results.append((gap_before_ri, True))
+
+    return results
+
+
 # ── Public interface ──────────────────────────────────────────────────────────
 
 def get_available_backends():
@@ -203,6 +324,11 @@ def get_available_backends():
         import ost      # noqa: F401
         backends.append(BACKEND_PROMOD3)
     except ImportError:
+        pass
+    try:
+        _load_native()
+        backends.append(BACKEND_KIC)
+    except (FileNotFoundError, Exception):
         pass
     return backends
 

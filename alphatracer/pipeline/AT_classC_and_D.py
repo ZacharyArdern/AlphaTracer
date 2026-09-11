@@ -186,6 +186,9 @@ def parse_args():
                    help='Max hits per query to NW-align before selecting best by coverage (default: 100)')
     p.add_argument('--no-fill-missing',     action='store_false', dest='fill_missing', default=True,
                    help='Fill non-domain regions with MLX MiniFold (classC)')
+    p.add_argument('--domains',             choices=['pae', 'dist'], default='dist',
+                   help='Domain inference method: pae (PAE graph clustering, requires download) '
+                        'or dist (Cα contact clustering, no PAE download) (default: dist)')
     p.add_argument('--min-frag-len',        type=int,   default=5)
     p.add_argument('--lbfgsb-iters',        type=int,   default=300)
     p.add_argument('--mini-model-size',     type=str,   default='12L',
@@ -216,8 +219,8 @@ def parse_args():
                    help='Skip MLX prediction for sequences longer than this (default: 1000). '
                         'ESM2-3B attention maps scale as L², causing Metal OOM for long seqs. '
                         'Set to 0 to disable the check.')
-    p.add_argument('--loop-closer',         default='ccd', choices=['ccd', 'promod3'],
-                   help='Loop closing backend for Class C: ccd (default) or promod3')
+    p.add_argument('--loop-closer',         default='ccd', choices=['ccd', 'promod3', 'kic'],
+                   help='Loop closing backend for Class C: ccd (default), promod3, or kic (native frag_db + analytical KIC, no Docker required)')
     p.add_argument('--promod3-data-dir',    default=None,
                    help='ProMod3 database directory (overrides PROMOD3_SHARED_DATA_PATH)')
     p.add_argument('--backend',             default='auto',
@@ -498,13 +501,13 @@ def build_domain_pdb(domain_indices, ops, ref_poly, out_pdb,
 
             elif op[0] == 'deletion':
                 if residues:
-                    gap_sites.append((len(residues) - 1, 'deletion'))
+                    gap_sites.append((len(residues) - 1, 'deletion', 0))
 
             elif op[0] == 'insertion':
                 ins_aas = op[1]
                 if not residues:
                     continue  # leading insertion before any matched residues — skip, same as leading deletion
-                gap_sites.append((len(residues) - 1, 'insertion'))
+                gap_sites.append((len(residues) - 1, 'insertion', len(ins_aas)))
                 prev = residues[-1]['atoms']
                 if not all(k in prev for k in ('N', 'CA', 'C')):
                     return False, 'cannot place insertion: prev residue missing backbone', 0.
@@ -533,7 +536,7 @@ def build_domain_pdb(domain_indices, ops, ref_poly, out_pdb,
                         flat_atoms.append((ri, aname))
                         flat_pos.append(res['atoms'][aname].copy())
 
-            for (gap_before_ri, gap_type) in gap_sites:
+            for (gap_before_ri, gap_type, _loop_len) in gap_sites:
                 after_ri   = gap_before_ri + 1
                 if after_ri >= len(residues):
                     continue
@@ -629,6 +632,11 @@ def build_domain_pdb(domain_indices, ops, ref_poly, out_pdb,
                         for _atom in _res:
                             residues[_ri]['atoms'][_atom.name] = [
                                 _atom.pos.x, _atom.pos.y, _atom.pos.z]
+
+        # ── Native KIC loop closing (frag_db + analytical KIC, no Docker) ────
+        if loop_closer == 'kic' and gap_sites:
+            from alphatracer.utils.loop_closer import close_gap_kic
+            close_gap_kic(residues, gap_sites)
 
         anchors = _find_segment_anchors(residues, ref_poly)
         system, top, pos_nm = _B.build_openmm_system(residues)
@@ -1835,8 +1843,9 @@ def main():
             c1_rows_raw.append(row)
         else:
             c2_rows_raw.append(row)
+    c2_label = 'PAE domain' if args.domains == 'pae' else 'dist domain'
     print(f'  C1 (high-coverage template): {len(c1_rows_raw)}  '
-          f'C2 (PAE domain):              {len(c2_rows_raw)}')
+          f'C2 ({c2_label}):              {len(c2_rows_raw)}')
 
     # ── [C-2+3/4-C1] C1: Download PDB only; domain = full aligned region ──────
     c1_afdb_ids = set()
@@ -1928,13 +1937,15 @@ def main():
 
     all_c2_afdb_ids = set(c2_afdb_ids_map.keys())
 
-    _write_status(f'Downloading PAE/PDB and detecting domains for {len(c2_rows_raw)} C2 sequences...')
-    print(f'\n[C-2+3/4-C2] Downloading PAE+PDB and qualifying domains '
+    _write_status(f'Downloading PDB and detecting domains for {len(c2_rows_raw)} C2 sequences...')
+    _pae_label = 'PAE+PDB' if args.domains == 'pae' else 'PDB'
+    print(f'\n[C-2+3/4-C2] Downloading {_pae_label} and qualifying domains '
           f'({len(c2_rows_raw)} sequences, threads={args.threads})...')
 
-    # Phase 2a: PAE
-    print('  [2a] Downloading PAE files (C2 only)...')
-    fetch_afdb_pae(all_c2_afdb_ids, pae_dir)
+    # Phase 2a: PAE (only when --domains pae)
+    if args.domains == 'pae':
+        print('  [2a] Downloading PAE files (C2 only)...')
+        fetch_afdb_pae(all_c2_afdb_ids, pae_dir)
 
     # Phase 2b: PDB
     print('  [2b] Downloading PDB files (C2)...')
@@ -1971,59 +1982,60 @@ def main():
             except Exception:
                 pass
 
-    # Phase 2c: Batch Rust PAE parse
-    print('  [2c] Batch-parsing PAE matrices (Rust)...')
-    _t2c = time.time()
-    _SIZE_THRESH = 350_000
-    pae_paths_map = {aid: _pae_local_path(aid, pae_dir)
-                     for aid in all_c2_afdb_ids
-                     if os.path.exists(_pae_local_path(aid, pae_dir))}
+    # Phase 2c: Batch Rust PAE parse (only when --domains pae)
     pae_matrices_by_afdb = {}
-    if pae_paths_map:
-        if args.pae_step:
-            groups = [(args.pae_step, pae_paths_map)]
-        else:
-            small = {a: p for a, p in pae_paths_map.items() if os.path.getsize(p) < _SIZE_THRESH}
-            large = {a: p for a, p in pae_paths_map.items() if os.path.getsize(p) >= _SIZE_THRESH}
-            groups = [(2, small), (3, large)]
-        for step, group in groups:
-            if not group:
-                continue
-            try:
-                aid_list  = list(group.keys())
-                path_list = [group[a] for a in aid_list]
-                matrices  = parse_pae_batch_rust(path_list, step=step)
-                for aid, path in zip(aid_list, path_list):
-                    if path in matrices:
-                        n_full, mat = matrices[path]
-                        pae_matrices_by_afdb[aid] = (n_full, mat, step)
-            except Exception as e:
-                print(f'  WARNING: Rust batch PAE parse (step={step}) failed ({e}); falling back to Python')
-                for aid, path in group.items():
-                    try:
-                        pae = _load_pae_matrix(path)
-                        pae_matrices_by_afdb[aid] = (pae.shape[0], pae.astype('float32'), 1)
-                    except Exception:
-                        pass
+    if args.domains == 'pae':
+        print('  [2c] Batch-parsing PAE matrices (Rust)...')
+        _t2c = time.time()
+        _SIZE_THRESH = 350_000
+        pae_paths_map = {aid: _pae_local_path(aid, pae_dir)
+                         for aid in all_c2_afdb_ids
+                         if os.path.exists(_pae_local_path(aid, pae_dir))}
+        if pae_paths_map:
+            if args.pae_step:
+                groups = [(args.pae_step, pae_paths_map)]
+            else:
+                small = {a: p for a, p in pae_paths_map.items() if os.path.getsize(p) < _SIZE_THRESH}
+                large = {a: p for a, p in pae_paths_map.items() if os.path.getsize(p) >= _SIZE_THRESH}
+                groups = [(2, small), (3, large)]
+            for step, group in groups:
+                if not group:
+                    continue
+                try:
+                    aid_list  = list(group.keys())
+                    path_list = [group[a] for a in aid_list]
+                    matrices  = parse_pae_batch_rust(path_list, step=step)
+                    for aid, path in zip(aid_list, path_list):
+                        if path in matrices:
+                            n_full, mat = matrices[path]
+                            pae_matrices_by_afdb[aid] = (n_full, mat, step)
+                except Exception as e:
+                    print(f'  WARNING: Rust batch PAE parse (step={step}) failed ({e}); falling back to Python')
+                    for aid, path in group.items():
+                        try:
+                            pae = _load_pae_matrix(path)
+                            pae_matrices_by_afdb[aid] = (pae.shape[0], pae.astype('float32'), 1)
+                        except Exception:
+                            pass
 
-    n_esm_pae = 0
-    seen_esm_ph = set()
-    for row in c2_esm_rows_list:
-        ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
-        if ph in seen_esm_ph or ph in pae_matrices_by_afdb:
-            continue
-        seen_esm_ph.add(ph)
-        npy_path = os.path.join(pae_dir, f'esm_{ph}.pae.npy')
-        if os.path.exists(npy_path):
-            try:
-                mat = np.load(npy_path).astype(np.float32)
-                pae_matrices_by_afdb[ph] = (mat.shape[0], mat, 1)
-                n_esm_pae += 1
-            except Exception:
-                pass
-    if c2_esm_rows_list:
-        print(f'  ESM PAE loaded: {n_esm_pae}/{len(seen_esm_ph)} matrices')
-    print(f'  PAE parse: {time.time()-_t2c:.2f}s  ({len(pae_matrices_by_afdb)} matrices)')
+        n_esm_pae = 0
+        seen_esm_ph = set()
+        for row in c2_esm_rows_list:
+            ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
+            if ph in seen_esm_ph or ph in pae_matrices_by_afdb:
+                continue
+            seen_esm_ph.add(ph)
+            npy_path = os.path.join(pae_dir, f'esm_{ph}.pae.npy')
+            if os.path.exists(npy_path):
+                try:
+                    mat = np.load(npy_path).astype(np.float32)
+                    pae_matrices_by_afdb[ph] = (mat.shape[0], mat, 1)
+                    n_esm_pae += 1
+                except Exception:
+                    pass
+        if c2_esm_rows_list:
+            print(f'  ESM PAE loaded: {n_esm_pae}/{len(seen_esm_ph)} matrices')
+        print(f'  PAE parse: {time.time()-_t2c:.2f}s  ({len(pae_matrices_by_afdb)} matrices)')
     _t2d = time.time()
 
     # Phase 3: domain detection for C2
@@ -2082,6 +2094,83 @@ def main():
             return None, 'domain_low_plddt'
         return {**row, '_best_domain': best}, 'ok'
 
+    def _qualify_row_dist(row, ref_poly):
+        """Domain inference via Cα contact graph clustering (no PAE needed)."""
+        import igraph as _ig
+        from collections import defaultdict as _dd
+        _, ops = _B.parse_alignment_ops(row['qseq_alg'], row['sseq_alg'])
+        aln_positions = [op[1] for op in ops if op[0] in ('match', 'mismatch')]
+        aln_positions = [p for p in aln_positions if p < len(ref_poly)]
+        if not aln_positions:
+            return None, 'no_domain'
+        coords, plddt_vals, pos_list = [], [], []
+        for pos in aln_positions:
+            ca = ref_poly[pos].find_atom('CA', '\0')
+            if ca:
+                coords.append([ca.pos.x, ca.pos.y, ca.pos.z])
+                plddt_vals.append(ca.b_iso)
+                pos_list.append(pos)
+        if not coords:
+            return None, 'no_domain'
+        coords_arr = np.array(coords, dtype=np.float32)
+        plddt_arr  = np.array(plddt_vals, dtype=np.float32)
+        _DIST_PLDDT_HARD = 60.0
+        mask = plddt_arr >= _DIST_PLDDT_HARD
+        if mask.sum() < args.min_domain_size:
+            return None, 'domain_too_small'
+        hc_idx      = np.where(mask)[0]
+        hc_coords   = coords_arr[hc_idx]
+        hc_plddt    = plddt_arr[hc_idx]
+        hc_pos_list = [pos_list[i] for i in hc_idx]
+        n = len(hc_coords)
+        # pairwise distances via broadcasting
+        diff = hc_coords[:, None, :] - hc_coords[None, :, :]
+        D    = np.sqrt((diff ** 2).sum(axis=-1))
+        ri, ci = np.where((D < 8.0) & (D > 0))
+        g = _ig.Graph(n=n, edges=list(zip(ri.tolist(), ci.tolist())))
+        if len(ri):
+            g.es['weight'] = (1.0 / D[ri, ci]).tolist()
+            membership = g.community_leiden(objective_function='modularity',
+                weights='weight', resolution=1.0, n_iterations=2).membership
+        else:
+            membership = list(range(n))
+        clusters = _dd(list)
+        for i, m in enumerate(membership):
+            clusters[m].append(i)
+        best_cluster = max(clusters.values(), key=len)
+        domain = [hc_pos_list[i] for i in best_cluster]
+        if len(domain) < args.min_domain_size:
+            return None, 'domain_too_small'
+        mean_plddt = float(hc_plddt[best_cluster].mean())
+        if mean_plddt < args.min_domain_plddt:
+            return None, 'domain_low_plddt'
+        return {**row, '_best_domain': domain}, 'ok'
+
+    def _qualify_with_sw_fallback_dist(row, ref_poly):
+        """SW-alignment retry for dist-mode domain inference."""
+        try:
+            r = parasail.sw_trace_striped_16(
+                row['full_qseq'], row['full_sseq'], 10, 1, parasail.blosum45)
+            sw_row = {**row, 'qseq_alg': r.traceback.query,
+                      'sseq_alg': r.traceback.ref,
+                      'alg_comp': r.traceback.comp.replace(' ', '-')}
+        except Exception:
+            return None, 'no_domain'
+        pairs = [(q, s) for q, s in zip(sw_row['qseq_alg'], sw_row['sseq_alg'])
+                 if q != '-' and s != '-']
+        if pairs:
+            identity = sum(1 for q, s in pairs if q == s) / len(pairs)
+            coverage = len(pairs) / len(row['full_qseq'])
+            if coverage >= C1_COV_THRESH and identity >= threshold_frac:
+                result, status = _qualify_c1(sw_row)
+                if status == 'ok' and result:
+                    result['_sw_rescue'] = True
+                return result, status
+        result, status = _qualify_row_dist(sw_row, ref_poly)
+        if status == 'ok' and result:
+            result['_sw_rescue'] = True
+        return result, status
+
     def _qualify_with_sw_fallback(row, ref_poly, n_full, pae_matrix, step):
         """Retry C2 qualification with SW alignment when NW gives no_domain."""
         try:
@@ -2114,6 +2203,14 @@ def main():
         ref_poly = _ref_poly_cache.get(afdb_id)
         if ref_poly is None:
             return [(None, 'skip')] * len(rows)
+        if args.domains == 'dist':
+            results = []
+            for row in rows:
+                result, status = _qualify_row_dist(row, ref_poly)
+                if status == 'no_domain':
+                    result, status = _qualify_with_sw_fallback_dist(row, ref_poly)
+                results.append((result, status))
+            return results
         pae_data = pae_matrices_by_afdb.get(afdb_id)
         if pae_data is None:
             return [(None, 'no_pae')] * len(rows)
@@ -2135,7 +2232,15 @@ def main():
             c2_qual_results.extend(fut.result())
 
     def _qualify_esm_dispatch(row):
-        ph       = row.get('protein_hash') or row['sseqid'].split('|')[0]
+        ph = row.get('protein_hash') or row['sseqid'].split('|')[0]
+        if args.domains == 'dist':
+            ref_poly = _ref_poly_cache.get(ph)
+            if ref_poly is None:
+                return None, 'no_pdb'
+            result, status = _qualify_row_dist(row, ref_poly)
+            if status == 'no_domain':
+                result, status = _qualify_with_sw_fallback_dist(row, ref_poly)
+            return result, status
         pae_data = pae_matrices_by_afdb.get(ph)
         if pae_data is not None:
             ref_poly = _ref_poly_cache.get(ph)
@@ -2183,7 +2288,8 @@ def main():
             n_no_pdb += 1
 
     print(f'  Qualifying:         {n_qualify}  (C1={n_c1_ok}, C2={n_c2_ok}, SW rescues={n_sw_rescue})')
-    print(f'  No PAE file:        {n_no_pae}')
+    if args.domains == 'pae':
+        print(f'  No PAE file:        {n_no_pae}')
     print(f'  No domain:          {n_no_domain}')
     if n_too_small:
         print(f'  Domain too small:   {n_too_small}  (<{args.min_domain_size} residues → Class D)')
@@ -2311,6 +2417,10 @@ def main():
             print(f'  {qseqid}: FAILED — {err}')
             failure_reasons_C[qseqid] = err or ''
             n_fail_C += 1
+
+    if args.loop_closer == 'kic':
+        from alphatracer.utils.loop_closer import _load_native as _kic_preload
+        _kic_preload()  # load fragment DB in main thread before workers start
 
     if args.fill_missing:
         # Must stay on main thread so MLX GPU stream is valid

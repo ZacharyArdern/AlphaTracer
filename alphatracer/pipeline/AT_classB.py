@@ -118,7 +118,7 @@ def parse_args():
                    help='CCD convergence tolerance in Å (default: 0.15)')
     p.add_argument('--flank',         type=int,   default=3,
                    help='Mobile flanking residues for CCD (default: 3)')
-    p.add_argument('--loop-closer',   default='ccd', choices=['ccd', 'promod3'],
+    p.add_argument('--loop-closer',   default='ccd', choices=['ccd', 'promod3', 'kic'],
                    help='Loop closing backend: ccd (default) or promod3')
     p.add_argument('--promod3-data-dir', default=None,
                    help='ProMod3 database directory (overrides PROMOD3_SHARED_DATA_PATH)')
@@ -952,7 +952,7 @@ def build_classB_structure(row, pdb_dir, out_pdb, mm_iters, ccd_iters,
             elif op[0] == 'deletion':
                 # Mark gap: the last residue so far needs to connect to the next
                 if residues:
-                    gap_sites.append((len(residues) - 1, 'deletion'))
+                    gap_sites.append((len(residues) - 1, 'deletion', 0))
 
             elif op[0] == 'insertion':
                 ins_aas = op[1]   # op = ('insertion', aas, left_rpos, right_rpos)
@@ -960,7 +960,7 @@ def build_classB_structure(row, pdb_dir, out_pdb, mm_iters, ccd_iters,
                     return False, 'insertion at chain start not supported', 0.
 
                 # Mark that a gap exists before these inserted residues
-                gap_sites.append((len(residues) - 1, 'insertion'))
+                gap_sites.append((len(residues) - 1, 'insertion', len(ins_aas)))
 
                 # Place inserted residues using helix angles if both flanking
                 # reference residues are in a helix, otherwise extended conformation
@@ -1006,7 +1006,7 @@ def build_classB_structure(row, pdb_dir, out_pdb, mm_iters, ccd_iters,
                         flat_atoms.append((ri, aname))
                         flat_pos.append(res['atoms'][aname].copy())
 
-            for (gap_before_ri, gap_type) in gap_sites:
+            for (gap_before_ri, gap_type, _loop_len) in gap_sites:
                 # The residue AFTER the gap
                 after_ri = gap_before_ri + 1
                 if after_ri >= len(residues):
@@ -1122,6 +1122,11 @@ def build_classB_structure(row, pdb_dir, out_pdb, mm_iters, ccd_iters,
                             for _atom in _res:
                                 residues[_ri]['atoms'][_atom.name] = [
                                     _atom.pos.x, _atom.pos.y, _atom.pos.z]
+
+        # ── 4c. KIC loop closing ───────────────────────────────────────────────
+        if loop_closer == 'kic' and gap_sites:
+            from alphatracer.utils.loop_closer import close_gap_kic
+            close_gap_kic(residues, gap_sites)
 
         # ── 5. OpenMM minimisation (skipped if no backbone clashes after CCD) ───
         system, top, pos_nm = build_openmm_system(residues)
@@ -1350,6 +1355,10 @@ def main():
                 max_indels=args.max_indels, max_indel_len=args.max_indel_len,
             )
         return qseqid, ok, err, elapsed, False, db_type
+
+    if args.loop_closer == 'kic':
+        from alphatracer.utils.loop_closer import _load_native as _kic_preload
+        _kic_preload()  # load fragment DB in main thread before workers start
 
     from concurrent.futures import as_completed
     with ThreadPoolExecutor(max_workers=args.threads) as ex:

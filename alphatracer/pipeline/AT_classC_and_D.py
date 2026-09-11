@@ -1862,49 +1862,58 @@ def main():
 
     _write_status(f'Aligning {len(candidates)} Class C candidates ({n_queries} queries)...')
     print(f'\n[C-1/4] Aligning {len(candidates)} candidates for {n_queries} queries '
-          f'(threads={args.threads})...')
-    rows_list = list(candidates.iter_rows(named=True))
-    total     = len(rows_list)
+          f'(threads={args.threads}, early-exit coverage≥0.80)...')
 
-    def _aln_c(row):
-        return _B.align_nw(row['qseqid'], row['sseqid'],
-                           row['full_qseq'], row['full_sseq'])
+    # Group candidates by query, preserving kmer-rank order within each group
+    _EARLY_EXIT_COV = 0.80
+    query_groups: dict[str, list] = {}
+    for row in candidates.iter_rows(named=True):
+        query_groups.setdefault(row['qseqid'], []).append(row)
 
-    aln_rows = []
+    def _aln_query(query_rows):
+        """Align candidates in rank order; stop when NW coverage >= _EARLY_EXIT_COV."""
+        best_result = None
+        best_cov    = -1.0
+        qlen        = max(len(query_rows[0]['full_qseq']), 1)
+        for row in query_rows:
+            result = _B.align_nw(row['qseqid'], row['sseqid'],
+                                 row['full_qseq'], row['full_sseq'])
+            if result is None:
+                continue
+            qa, sa = result[2], result[3]
+            cov = sum(1 for a, b in zip(qa, sa) if a != '-' and b != '-') / qlen
+            if cov > best_cov:
+                best_cov    = cov
+                best_result = (row, result, cov)
+            if best_cov >= _EARLY_EXIT_COV:
+                break
+        return best_result  # (candidate_row, aln_tuple, coverage) or None
+
+    query_list = list(query_groups.values())
+    n_queries_total = len(query_list)
+    best_per_query = []
     done = 0
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
-        for result in ex.map(_aln_c, rows_list):
+        for result in ex.map(_aln_query, query_list):
             done += 1
-            if result:
-                aln_rows.append(result)
-            if done % 200 == 0 or done == total:
-                print(f'  {done}/{total}...', end='\r')
+            if result is not None:
+                best_per_query.append(result)
+            if done % 50 == 0 or done == n_queries_total:
+                print(f'  {done}/{n_queries_total} queries...', end='\r')
     print()
 
-    if not aln_rows:
+    if not best_per_query:
         print('No alignments.'); return
 
-    aln_df = pl.DataFrame(aln_rows,
-                          schema=['qseqid', 'sseqid', 'qseq_alg',
-                                  'sseq_alg', 'alg_comp'],
-                          orient='row')
-    # Select best hit per query by alignment coverage (matched residues / qlen)
-    def _coverage(r):
-        return sum(1 for a, b in zip(r['qseq_alg'], r['sseq_alg'])
-                   if a != '-' and b != '-') / max(r['qlen'], 1)
-
-    merged = (
-        candidates.join(aln_df, on=['qseqid', 'sseqid'], how='inner')
-        .with_columns(
-            pl.struct(['qseq_alg', 'sseq_alg', 'qlen'])
-            .map_elements(_coverage, return_dtype=pl.Float64)
-            .alias('aln_coverage')
-        )
-        .sort('aln_coverage', descending=True)
-        .group_by('qseqid', maintain_order=True)
-        .agg(pl.all().first())
-        .drop('aln_coverage')
-    )
+    # Build merged dataframe: one row per query (best hit already selected)
+    merged_rows = []
+    for cand_row, aln_tuple, cov in best_per_query:
+        merged_rows.append({**cand_row,
+                            'qseq_alg':    aln_tuple[2],
+                            'sseq_alg':    aln_tuple[3],
+                            'alg_comp':    aln_tuple[4],
+                            'aln_coverage': cov})
+    merged = pl.DataFrame(merged_rows).drop('aln_coverage')
 
     # ── [C-1b] C1/C2 split: classify by alignment coverage + identity ─────────
     # C1: NW coverage ≥ 70% of qlen AND identity ≥ min_pctsim → use full aligned

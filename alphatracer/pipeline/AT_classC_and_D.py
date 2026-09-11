@@ -158,7 +158,7 @@ def parse_args():
     )
     p.add_argument('-i', '--input-dir', required=True,
                    help='Processing directory from AT_classA.py / AT_classB.py')
-    p.add_argument('-t', '--threads',       type=int,   default=4)
+    p.add_argument('-t', '--threads',       type=int,   default=os.cpu_count())
     # Class C options
     p.add_argument('--min-pctsim',           type=float, default=40.0)
     p.add_argument('--window-size',         type=int,   default=40)

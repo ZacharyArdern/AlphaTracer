@@ -345,8 +345,8 @@ def parse_args() -> argparse.Namespace:
     shared.add_argument('--sketch-db', default=None, nargs='+', metavar='PATH',
                         help='Custom sketch database parquet(s) for kmer Class A search '
                              '(e.g. AFDB, ESMAtlas). Multiple paths accepted. Forwarded to AT_classA_kmer.py.')
-    shared.add_argument('-t', '--threads', type=int, default=4,
-                        help='CPU threads')
+    shared.add_argument('-t', '--threads', type=int, default=os.cpu_count(),
+                        help='CPU threads (default: all available)')
     shared.add_argument('--mm-iters', type=int, default=300,
                         help='OpenMM minimisation iterations (Class B/C/D)')
     shared.add_argument('--ccd-iters', type=int, default=200,

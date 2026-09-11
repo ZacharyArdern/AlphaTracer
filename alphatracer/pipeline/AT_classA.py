@@ -61,7 +61,7 @@ def parse_args():
     p.add_argument('-d', '--database',
                    default=os.path.join(_afdb_dir, 'bacarc8080.dmnd'),
                    help='DIAMOND database (default: $AT_AFDB_DIR/bacarc8080.dmnd or cwd)')
-    p.add_argument('-t', '--threads', type=int, default=4,
+    p.add_argument('-t', '--threads', type=int, default=os.cpu_count(),
                    help='CPU threads for DIAMOND and parallel downloads')
     p.add_argument('--window-size', type=int, default=40,
                    help='Sliding window size for identity check (default: 40)')

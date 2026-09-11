@@ -102,7 +102,7 @@ def parse_args():
     )
     p.add_argument('-i', '--input-dir', required=True,
                    help='Processing directory produced by AT_classA.py')
-    p.add_argument('-t', '--threads', type=int, default=4)
+    p.add_argument('-t', '--threads', type=int, default=os.cpu_count())
     p.add_argument('--max-indels',          type=int, default=3)
     p.add_argument('--max-indel-len',       type=int, default=5)
     p.add_argument('--max-loop-indels',     type=int, default=8,

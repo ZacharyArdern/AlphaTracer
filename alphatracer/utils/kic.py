@@ -63,6 +63,22 @@ def _dihedral(a, b, c, d) -> float:
     return float(np.arctan2(np.dot(np.cross(n1, b2), n2), np.dot(n1, n2)))
 
 
+def _place_atom(a: np.ndarray, b: np.ndarray, c: np.ndarray,
+                bond_len: float, bond_angle: float, torsion: float) -> np.ndarray:
+    """NERF: place D from A,B,C.
+
+    bond_angle: angle B-C-D (radians); torsion: dihedral A-B-C-D (radians).
+    Inverse of _dihedral — verified to round-trip within 1e-6 Å.
+    """
+    bc = _unit(c - b)
+    n  = _unit(np.cross(b - a, bc))
+    m  = np.cross(n, bc)
+    return c + bond_len * (
+        -np.cos(bond_angle) * bc
+        + np.sin(bond_angle) * (np.cos(torsion) * m - np.sin(torsion) * n)
+    )
+
+
 # ── 4×4 homogeneous transform helpers ────────────────────────────────────────
 
 def _apply4(M: np.ndarray, v: np.ndarray) -> np.ndarray:

@@ -452,6 +452,58 @@ def _add_anchor_restraints(system, residues, anchors, k_kj_mol_nm2=1000.0):
     system.addForce(force)
 
 
+# ── Junction geometry helpers ─────────────────────────────────────────────────
+
+_C_N_LEN  = 1.329            # Å, peptide C-N bond
+_CA_C_N   = np.radians(116.2) # CA-C-N bond angle
+_OMEGA    = np.pi             # trans-peptide torsion
+
+_PDB_ATOM_ORDER = ('N', 'CA', 'C', 'O', 'CB')
+_PDB_ELEMENTS   = {'N': ' N', 'CA': ' C', 'C': ' C', 'O': ' O', 'CB': ' C'}
+
+
+def _repair_junctions(residues, gap_sites):
+    """NERF-rebuild N atoms at gap junctions with ideal trans-peptide C-N geometry.
+
+    gap_sites: list of int or 3-tuple (gap_before_ri, gap_type, loop_len).
+    """
+    from alphatracer.utils.kic import _place_atom
+    for gs in gap_sites:
+        gap_before_ri = gs if isinstance(gs, int) else gs[0]
+        after_ri = gap_before_ri + 1
+        if after_ri >= len(residues):
+            continue
+        before = residues[gap_before_ri]['atoms']
+        if not all(k in before for k in ('N', 'CA', 'C')):
+            continue
+        after = residues[after_ri]['atoms']
+        after['N'] = _place_atom(
+            np.asarray(before['N'],  dtype=np.float64),
+            np.asarray(before['CA'], dtype=np.float64),
+            np.asarray(before['C'],  dtype=np.float64),
+            _C_N_LEN, _CA_C_N, _OMEGA,
+        )
+
+
+def _write_residues_pdb(residues, path):
+    """Write residues dict to a PDB file (no OpenMM required)."""
+    serial = 1
+    with open(path, 'w') as fh:
+        for ri, res in enumerate(residues):
+            resname = res.get('resname', 'ALA')
+            for aname in _PDB_ATOM_ORDER:
+                if aname not in res['atoms']:
+                    continue
+                x, y, z = res['atoms'][aname]
+                elem = _PDB_ELEMENTS.get(aname, ' C')
+                fh.write(
+                    f'ATOM  {serial:5d} {aname:<4s} {resname:<3s} A{ri+1:4d}    '
+                    f'{x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00          {elem}\n'
+                )
+                serial += 1
+        fh.write('END\n')
+
+
 # ── Domain PDB builder ────────────────────────────────────────────────────────
 
 def build_domain_pdb(domain_indices, ops, ref_poly, out_pdb,
@@ -638,18 +690,24 @@ def build_domain_pdb(domain_indices, ops, ref_poly, out_pdb,
             from alphatracer.utils.loop_closer import close_gap_kic
             close_gap_kic(residues, gap_sites)
 
-        anchors = _find_segment_anchors(residues, ref_poly)
-        system, top, pos_nm = _B.build_openmm_system(residues)
-        _add_anchor_restraints(system, residues, anchors, anchor_k)
-        integrator = LangevinMiddleIntegrator(
-            300 * unit.kelvin, 1.0 / unit.picosecond, 0.004 * unit.picoseconds
-        )
-        sim = Simulation(top, system, integrator, platform=_B._get_platform())
-        sim.context.setPositions(pos_nm)
-        sim.minimizeEnergy(maxIterations=mm_iters)
-        state = sim.context.getState(getPositions=True)
-        with open(out_pdb, 'w') as f:
-            PDBFile.writeFile(top, state.getPositions(), f)
+        if gap_sites:
+            _repair_junctions(residues, gap_sites)
+
+        if _B._has_backbone_clash(residues):
+            anchors = _find_segment_anchors(residues, ref_poly)
+            system, top, pos_nm = _B.build_openmm_system(residues)
+            _add_anchor_restraints(system, residues, anchors, anchor_k)
+            integrator = LangevinMiddleIntegrator(
+                300 * unit.kelvin, 1.0 / unit.picosecond, 0.004 * unit.picoseconds
+            )
+            sim = Simulation(top, system, integrator, platform=_B._get_platform())
+            sim.context.setPositions(pos_nm)
+            sim.minimizeEnergy(maxIterations=mm_iters)
+            state = sim.context.getState(getPositions=True)
+            with open(out_pdb, 'w') as f:
+                PDBFile.writeFile(top, state.getPositions(), f)
+        else:
+            _write_residues_pdb(residues, out_pdb)
 
         return True, None, time.perf_counter() - t0
 
@@ -1670,18 +1728,24 @@ def build_complete_structure(
             for (ri, aname), pos in zip(flat_atoms, flat_pos):
                 residues[ri]['atoms'][aname] = pos
 
-        anchors = _find_segment_anchors(residues, ref_poly)
-        system, top, pos_nm = _B.build_openmm_system(residues)
-        _add_anchor_restraints(system, residues, anchors, anchor_k)
-        integrator = LangevinMiddleIntegrator(
-            300 * unit.kelvin, 1.0 / unit.picosecond, 0.004 * unit.picoseconds
-        )
-        sim = Simulation(top, system, integrator, platform=_B._get_platform())
-        sim.context.setPositions(pos_nm)
-        sim.minimizeEnergy(maxIterations=mm_iters)
-        state = sim.context.getState(getPositions=True)
-        with open(out_pdb, 'w') as fh:
-            PDBFile.writeFile(top, state.getPositions(), fh)
+        if gap_sites:
+            _repair_junctions(residues, gap_sites)
+
+        if _B._has_backbone_clash(residues):
+            anchors = _find_segment_anchors(residues, ref_poly)
+            system, top, pos_nm = _B.build_openmm_system(residues)
+            _add_anchor_restraints(system, residues, anchors, anchor_k)
+            integrator = LangevinMiddleIntegrator(
+                300 * unit.kelvin, 1.0 / unit.picosecond, 0.004 * unit.picoseconds
+            )
+            sim = Simulation(top, system, integrator, platform=_B._get_platform())
+            sim.context.setPositions(pos_nm)
+            sim.minimizeEnergy(maxIterations=mm_iters)
+            state = sim.context.getState(getPositions=True)
+            with open(out_pdb, 'w') as fh:
+                PDBFile.writeFile(top, state.getPositions(), fh)
+        else:
+            _write_residues_pdb(residues, out_pdb)
 
         return True, None, time.perf_counter() - t0
 

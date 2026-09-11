@@ -60,7 +60,16 @@ pub fn build_alphabet(scheme: &str) -> ([u8; 256], usize) {
             for &c in b"Cc"         { t[c as usize] = 5; }
             6
         }
-        _ => panic!("Unknown recoding scheme '{scheme}'. Valid: murphy2000_4, murphy2000_5, murphy2000_8, dayhoff1978_6"),
+        "amino20" => {
+            // Standard 20-letter alphabet; no compression.
+            // flat_size = 20^k: k=7 needs ~5 GB RAM for Pass 1, k>=8 is not viable.
+            for (i, pair) in b"AaCcDdEeFfGgHhIiKkLlMmNnPpQqRrSsTtVvWwYy".chunks(2).enumerate() {
+                t[pair[0] as usize] = i as u8;
+                t[pair[1] as usize] = i as u8;
+            }
+            20
+        }
+        _ => panic!("Unknown recoding scheme '{scheme}'. Valid: murphy2000_4, murphy2000_5, murphy2000_8, dayhoff1978_6, amino20"),
     };
     (t, n)
 }

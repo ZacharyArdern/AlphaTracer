@@ -600,29 +600,27 @@ def _atom_indices(residues):
 _VDW_R = {'N': 1.55, 'CA': 1.70, 'C': 1.70, 'O': 1.52, 'CB': 1.70}
 
 
-def _has_backbone_clash(residues, threshold=0.72):
-    """Return True if any non-bonded backbone atom pair is closer than threshold × (r1+r2).
+def _has_backbone_clash(residues, clash_dist=3.5, min_seq_sep=5):
+    """True if any CA pair separated by >= min_seq_sep residues is closer than clash_dist Å.
 
-    Skips adjacent atoms (bonded neighbours within the same or consecutive residues).
-    Uses a numpy pairwise distance matrix for speed.
+    Uses CA-only residue-level check to avoid false positives from bonded atom pairs
+    (e.g. peptide C–N bonds which are ~1.33 Å and would trip flat-index checks).
+    clash_dist=3.5 Å catches real geometry problems; minor VDW overlaps are ignored.
     """
-    coords, radii = [], []
-    for res in residues:
-        for aname in ('N', 'CA', 'C', 'O', 'CB'):
-            if aname in res['atoms']:
-                coords.append(res['atoms'][aname])
-                radii.append(_VDW_R.get(aname, 1.70))
-    if len(coords) < 4:
+    ca_ri, cas = [], []
+    for ri, res in enumerate(residues):
+        if 'CA' in res['atoms']:
+            ca_ri.append(ri)
+            cas.append(res['atoms']['CA'])
+    if len(cas) < min_seq_sep + 1:
         return False
-    coords = np.array(coords)
-    radii  = np.array(radii)
-    diff   = coords[:, None, :] - coords[None, :, :]
+    cas    = np.array(cas, dtype=np.float64)
+    ri_arr = np.array(ca_ri)
+    diff   = cas[:, None, :] - cas[None, :, :]
     dist   = np.sqrt((diff * diff).sum(axis=-1))
-    sum_r  = radii[:, None] + radii[None, :]
-    # upper triangle only, skip i and i+1 (bonded neighbours)
-    n    = len(coords)
-    mask = np.triu(np.ones((n, n), dtype=bool), k=2)
-    return bool(np.any(dist[mask] < threshold * sum_r[mask]))
+    sep    = np.abs(ri_arr[:, None] - ri_arr[None, :])
+    mask   = np.triu(sep >= min_seq_sep, k=1)
+    return bool(np.any(dist[mask] < clash_dist))
 
 
 def build_openmm_system(residues):

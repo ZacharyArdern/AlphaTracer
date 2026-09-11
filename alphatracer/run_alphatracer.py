@@ -421,6 +421,8 @@ def parse_args() -> argparse.Namespace:
                         help='Limit Class C to first N sequences (0=all)')
     grp_cd.add_argument('--no-fill-missing', action='store_false', dest='fill_missing', default=True,
                         help='Fill non-domain query regions with OFS+MLX MiniFold (Class C)')
+    grp_cd.add_argument('--no-fold', action='store_true', default=False,
+                        help='Shortcut for --no-fill-missing --no-classD (template-only, no de-novo prediction)')
     grp_cd.add_argument('--min-frag-len', type=int, default=5,
                         help='Minimum fragment length to predict (Class C fill-missing)')
     grp_cd.add_argument('--lbfgsb-iters', type=int, default=300,
@@ -475,6 +477,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if args.no_fold:
+        args.fill_missing = False
+        args.no_classD    = True
 
     # Resolve dbdir and propagate to all subprocesses via AT_AFDB_DIR.
     dbdir = os.path.abspath(args.dbdir) if args.dbdir else os.getcwd()

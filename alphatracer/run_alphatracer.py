@@ -356,7 +356,7 @@ def parse_args() -> argparse.Namespace:
     shared.add_argument('--flank', type=int, default=3,
                         help='Mobile flanking residues for CCD (Class B/C)')
     shared.add_argument('--loop-closer', default='ccd',
-                        choices=['ccd', 'promod3'],
+                        choices=['ccd', 'promod3', 'kic'],
                         help='Loop closing backend: ccd (default) or promod3 '
                              '(fragment DB + CCD, requires OST/ProMod3)')
     shared.add_argument('--full-pdbs', action='store_true', default=False,

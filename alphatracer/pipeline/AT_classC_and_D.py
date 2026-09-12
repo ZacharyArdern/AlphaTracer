@@ -6,7 +6,7 @@ Class C: domain-level matching for sequences not in Class A/B.
   Decomposes best-hit reference structures into rigid domains via PAE graph
   clustering.  Domains passing window-identity and beta-strand-indel checks
   are built with backbone grafting + CCD + OpenMM minimisation.
-  Query regions outside the qualifying domain are filled using MLX MiniFold
+  Query regions outside the qualifying domain are filled using MLX MiniFoldX
   predictions + L-BFGS-B + CCD (use --no-fill-missing to disable).
 
 Class D: full-length structure prediction for every query sequence not covered
@@ -16,9 +16,8 @@ Class D: full-length structure prediction for every query sequence not covered
   if mean pLDDT < --plddt-threshold.  If round-0 pLDDT < --min-recycle-plddt the
   sequence is accepted immediately (likely disordered; recycling won't help).
 
-  On Apple Silicon (M-series Mac): MLX MiniFold is used for structure prediction.
-  On Linux / WSL / Intel Mac: PyTorch MiniFold (jwohlwend/minifold) is used instead,
-  requiring: pip install git+https://github.com/jwohlwend/minifold.git
+  On Apple Silicon (M-series Mac): MLX MiniFoldX is used for structure prediction.
+  On Linux / WSL / Intel Mac: PyTorch MiniFoldX is used instead (via minifoldx.pytorch).
   Backend can be overridden with --backend {auto|mlx|cuda|cpu}.
 
 Usage
@@ -92,7 +91,7 @@ ONE_TO_THREE = _A.ONE_TO_THREE
 
 # ── MiniFold-MLX weight paths (downloaded from HuggingFace on first use) ─────
 
-_HF_REPO = 'z-ardern/MiniFold_MLX_weights'
+_HF_REPO = 'z-ardern/MiniFoldX_weights'
 
 
 def _get_weights(model_size='48L', use_quantized_esm=True):
@@ -114,7 +113,7 @@ def _get_weights(model_size='48L', use_quantized_esm=True):
     return str(esm_path), str(minifold_path)
 
 # Global state — each loaded at most once
-# MLX: (tokenizer, minifold_mlx, pad_id)
+# MLX: (tokenizer, minifoldx_model, pad_id)
 # PT:  (predict_mod, alphabet, model, config, device)  — PyTorch fallback
 _MLX_STATE = None
 _PT_STATE  = None
@@ -156,8 +155,11 @@ def parse_args():
     p = argparse.ArgumentParser(
         description='AlphaTracer 1.0 — Class C + D pipeline'
     )
-    p.add_argument('-i', '--input-dir', required=True,
+    p.add_argument('-i', '--input-dir', default=None,
                    help='Processing directory from AT_classA.py / AT_classB.py')
+    p.add_argument('--batch', nargs='+', metavar='DIR', default=None,
+                   help='Process multiple processing directories in one invocation, '
+                        'amortizing model loading. Mutually exclusive with -i.')
     p.add_argument('-t', '--threads',       type=int,   default=os.cpu_count())
     # Class C options
     p.add_argument('--min-pctsim',           type=float, default=40.0)
@@ -832,36 +834,30 @@ def _split_broken_chains(pdb_path, ca_gap_threshold=5.5):
 # ── MLX model loading and prediction ─────────────────────────────────────────
 
 def _load_mlx_models(model_size='12L', compile_miniformer=True):
-    """Load MLX MiniFold (with fine-tuned ESM2 layers) once."""
+    """Load MiniFoldX (with fine-tuned ESM2 layers) once."""
     global _MLX_STATE
     if _MLX_STATE is not None:
         return
 
-    _write_status('Loading MLX model (ESM2-3B + MiniFold)...')
-    print('  [MLX] Loading MLX ESM2-3B + MiniFold (once)...', flush=True)
+    _write_status('Loading MLX model (ESM2-3B + MiniFoldX)...')
+    print('  [MLX] Loading MLX ESM2-3B + MiniFoldX (once)...', flush=True)
     t0 = time.perf_counter()
 
     import mlx.core as mx
-    import mlx.nn as nn_mlx
-    from minifold_mlx.esm2 import ESM2
-    from minifold_mlx import MiniFoldMLX
+    from minifoldx import load_model
 
     esm_path, minifold_path = _get_weights(model_size, use_quantized_esm=True)
 
-    tokenizer, esm_model = ESM2.from_pretrained(esm_path)
-    mx.eval(esm_model.parameters())
+    tokenizer, minifoldx_model = load_model(esm_path, minifold_path, bf16=True)
 
-    minifold_mlx = MiniFoldMLX.from_pretrained(minifold_path, esm_model=esm_model)
-    minifold_mlx.convert_to_bf16()
-
-    if compile_miniformer and hasattr(minifold_mlx, 'enable_compile_miniformer'):
-        minifold_mlx.enable_compile_miniformer()
+    if compile_miniformer and hasattr(minifoldx_model, 'enable_compile_miniformer'):
+        minifoldx_model.enable_compile_miniformer()
     elif compile_miniformer:
         print('  [MLX] enable_compile_miniformer not available — skipping', flush=True)
 
     pad_id = int(getattr(tokenizer, 'pad_id', 1))
 
-    _MLX_STATE = (tokenizer, minifold_mlx, pad_id)
+    _MLX_STATE = (tokenizer, minifoldx_model, pad_id)
     print(f'  [MLX] Ready in {time.perf_counter()-t0:.1f}s', flush=True)
 
 
@@ -914,10 +910,10 @@ def _mlx_predict(seq, num_recycling):
     """
     global _MLX_STATE
     import mlx.core as mx
-    from minifold_mlx._data import prepare_input, output_to_pdb
+    from minifoldx._data import prepare_input, output_to_pdb
 
     t0 = time.perf_counter()
-    tokenizer, minifold_mlx, pad_id = _MLX_STATE
+    tokenizer, minifoldx_model, pad_id = _MLX_STATE
 
     tokens, mask_np, aatype = prepare_input(seq, tokenizer)
     L = len(seq)
@@ -926,7 +922,7 @@ def _mlx_predict(seq, num_recycling):
     mask_mx   = mx.array(mask_np)[None]             # (1, L)
     aatype_mx = mx.array(aatype)[None]              # (1, L)
 
-    out = minifold_mlx(tokens_mx, seq_mask=mask_mx,
+    out = minifoldx_model(tokens_mx, seq_mask=mask_mx,
                        aatype_mx=aatype_mx,
                        num_recycling=num_recycling)
     mx.eval(out)
@@ -950,9 +946,9 @@ def _mlx_predict_batch(batch_items, num_recycling):
     """
     global _MLX_STATE
     import mlx.core as mx
-    from minifold_mlx._data import prepare_input, pad_tokens, pad_mask, pad_aatype, output_to_pdb
+    from minifoldx._data import prepare_input, pad_tokens, pad_mask, pad_aatype, output_to_pdb
 
-    tokenizer, minifold_mlx, pad_id = _MLX_STATE
+    tokenizer, minifoldx_model, pad_id = _MLX_STATE
 
     prepared = [(seq_id, seq, *prepare_input(seq, tokenizer))
                 for seq_id, seq in batch_items]
@@ -967,7 +963,7 @@ def _mlx_predict_batch(batch_items, num_recycling):
     mx.eval(tokens_mx, mask_mx, aatype_mx)
     mx.metal.clear_cache()
 
-    out = minifold_mlx(tokens_mx, seq_mask=mask_mx,
+    out = minifoldx_model(tokens_mx, seq_mask=mask_mx,
                        aatype_mx=aatype_mx,
                        num_recycling=num_recycling)
     mx.eval(out)
@@ -996,40 +992,21 @@ _PT_HF_CACHE = Path.home() / '.cache' / 'minifold'
 
 
 def _load_pt_models(model_size='12L'):
-    """Load PyTorch MiniFold on CUDA or CPU (non-Apple-Silicon fallback)."""
+    """Load PyTorch MiniFoldX on CUDA or CPU (non-Apple-Silicon fallback)."""
     global _PT_STATE
     if _PT_STATE is not None:
         return
 
-    _write_status('Loading PyTorch MiniFold model...')
-    print('  [PT] Loading PyTorch MiniFold...', flush=True)
+    _write_status('Loading PyTorch MiniFoldX model...')
+    print('  [PT] Loading PyTorch MiniFoldX...', flush=True)
     t0 = time.perf_counter()
 
     try:
-        import minifold as _mf_pkg
+        from minifoldx.pytorch import predict as predict_mod
     except ImportError:
         sys.exit(
-            'ERROR: minifold (PyTorch) is not installed.\n'
-            '  Run: pip install git+https://github.com/jwohlwend/minifold.git')
-
-    # Locate predict.py shipped alongside the installed package
-    import importlib.util
-    pkg_root = os.path.dirname(os.path.dirname(_mf_pkg.__file__))
-    for candidate in (
-        os.path.join(pkg_root, 'predict.py'),
-        os.path.join(os.path.dirname(_mf_pkg.__file__), 'predict.py'),
-    ):
-        if os.path.exists(candidate):
-            predict_py = candidate
-            break
-    else:
-        sys.exit(
-            f'ERROR: predict.py not found near minifold package ({pkg_root}).\n'
-            '  Re-install: pip install git+https://github.com/jwohlwend/minifold.git')
-
-    spec = importlib.util.spec_from_file_location('minifold_predict', predict_py)
-    predict_mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(predict_mod)
+            'ERROR: minifoldx is not installed.\n'
+            '  Run: pip install -e /path/to/MiniFoldX')
 
     import torch
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -1041,7 +1018,7 @@ def _load_pt_models(model_size='12L'):
     alphabet, model = predict_mod.create_model(checkpoint, device)
     model.eval()
 
-    from minifold.model.config import model_config
+    from minifoldx.pytorch.minifold.model.config import model_config
     config = model_config('initial_training', train=False, low_prec=False,
                           long_sequence_inference=False)
 
@@ -1781,10 +1758,10 @@ def build_complete_structure(
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
-    args           = parse_args()
+def process_one(input_dir, args):
+    """Process one processing directory through the Class C + D pipeline."""
     global _STATUS_PATH
-    indir          = args.input_dir.rstrip('/')
+    indir          = input_dir.rstrip('/')
     pdb_dir        = os.path.join(indir, 'AF_pdbs')
     pae_dir        = os.path.join(indir, 'AF_pae')
     outdir_C       = os.path.join(indir, 'output_pdbs_classC')
@@ -2770,6 +2747,30 @@ def main():
     print(f'  Table:  {table_D_path}')
     print(f'  Output: {outdir_D}/')
     print('=' * 60)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+
+    if args.batch:
+        if not args.batch:
+            return  # empty list — no-op
+        # Load models once before looping; _load_fold_models is idempotent so
+        # subsequent calls inside process_one are no-ops.
+        if args.fill_missing or not args.no_classD:
+            _load_fold_models(model_size=args.mini_model_size,
+                              compile_miniformer=not args.no_compile,
+                              backend=args.backend)
+        for input_dir in args.batch:
+            process_one(input_dir, args)
+        return
+
+    if args.input_dir is None:
+        sys.exit('[FATAL] -i / --input-dir is required (or use --batch)')
+
+    process_one(args.input_dir, args)
 
 
 if __name__ == '__main__':

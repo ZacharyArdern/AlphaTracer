@@ -116,8 +116,8 @@ def _ccd_step(positions, pivot_a, pivot_b, downstream_indices, end_idx, target):
     sin_a = np.dot(cross, axis)
     angle = np.arctan2(sin_a, cos_a)
     R = _rotation_matrix(axis, angle)
-    for idx in downstream_indices:
-        positions[idx] = positions[pivot_a] + R @ (positions[idx] - positions[pivot_a])
+    d = positions[downstream_indices] - positions[pivot_a]
+    positions[downstream_indices] = positions[pivot_a] + (R @ d.T).T
 
 
 def ccd_close(positions, pivot_bonds, end_idx, target, max_iter=200, tol=0.15):
@@ -133,10 +133,15 @@ def ccd_close(positions, pivot_bonds, end_idx, target, max_iter=200, tol=0.15):
     max_iter    : iteration limit
     tol         : convergence threshold (Å)
     """
+    # Pre-convert downstream index lists to numpy arrays once, outside the hot loop.
+    pivot_bonds_np = [
+        (a, b, np.asarray(ds, dtype=np.intp))
+        for a, b, ds in pivot_bonds
+    ]
     for _ in range(max_iter):
         if np.linalg.norm(positions[end_idx] - target) < tol:
             break
-        for pivot_a, pivot_b, downstream in pivot_bonds:
+        for pivot_a, pivot_b, downstream in pivot_bonds_np:
             _ccd_step(positions, pivot_a, pivot_b, downstream, end_idx, target)
     return positions
 
@@ -269,12 +274,12 @@ def close_gap_kic(residues: list, gap_sites: list) -> list:
             results.append((gap_before_ri, False))
             continue
 
-        n_stem_N  = np.array(n_atoms['N'],  float)
-        n_stem_CA = np.array(n_atoms['CA'], float)
-        n_stem_C  = np.array(n_atoms['C'],  float)
-        c_stem_N  = np.array(c_atoms['N'],  float)
-        c_stem_CA = np.array(c_atoms['CA'], float)
-        c_stem_C  = np.array(c_atoms['C'],  float)
+        n_stem_N  = np.asarray(n_atoms['N'],  float)
+        n_stem_CA = np.asarray(n_atoms['CA'], float)
+        n_stem_C  = np.asarray(n_atoms['C'],  float)
+        c_stem_N  = np.asarray(c_atoms['N'],  float)
+        c_stem_CA = np.asarray(c_atoms['CA'], float)
+        c_stem_C  = np.asarray(c_atoms['C'],  float)
 
         # Query fragment DB — candidates already in absolute coords at n_stem
         frag_coords, _ = db.query(
@@ -287,9 +292,15 @@ def close_gap_kic(residues: list, gap_sites: list) -> list:
             results.append((gap_before_ri, False))
             continue
 
+        # Cap the number of candidates to avoid O(N_frags) KIC calls when
+        # the fragment DB returns thousands of hits (e.g. short loops).
+        # The DB already orders by geometric similarity, so the best candidates
+        # come first. 64 is enough to find a closable solution in practice.
+        _MAX_KIC_CANDIDATES = 64
+
         # Try candidates through analytical KIC until one closes
         closed = None
-        for frag in frag_coords:
+        for frag in frag_coords[:_MAX_KIC_CANDIDATES]:
             sol = _kic_close(
                 frag,
                 n_stem_N, n_stem_CA, n_stem_C,

@@ -40,6 +40,15 @@ import numpy as np
 from scipy.linalg import eig
 from typing import Optional
 
+# ── Module-level pre-allocated eigenvalue matrices ───────────────────────────
+# The constant parts are filled once; only the non-constant parts are updated
+# per call to _solve_eigen, avoiding repeated allocations.
+_E0 = np.zeros((16, 16))
+_E0[:8, 8:] = np.eye(8)   # constant upper-right block
+
+_E1 = np.zeros((16, 16))
+_E1[:8, :8] = np.eye(8)   # constant upper-left block
+
 BL_CO = 1.229
 
 
@@ -304,14 +313,13 @@ def _fill_dixon(params: dict):
 
 def _solve_eigen(R0: np.ndarray, R1: np.ndarray, R2: np.ndarray) -> list:
     """Solve generalized 16×16 eigenvalue → list of (tau1, tau2, tau3) tuples."""
-    E0 = np.zeros((16, 16)); E1 = np.zeros((16, 16))
-    E0[:8, 8:] = np.eye(8)
+    E0 = _E0.copy()
+    E1 = _E1.copy()
     E0[8:, :8] = -R0
     E0[8:, 8:] = -R1
-    E1[:8, :8] = np.eye(8)
     E1[8:, 8:] = R2
 
-    w, vr = eig(E0, E1)
+    w, vr = eig(E0, E1, check_finite=False)
 
     taus = []
     for i in range(16):
@@ -371,21 +379,45 @@ def _apply_solution(
     pre = f1_H @ f1_G @ f1_F
     f2_transform = pre @ f2_E @ current_f2
 
-    # Which transform applies to each residue/atom (ProMod3 ApplySolution)
-    def _t(i, atom):
-        # atom: 0=N, 1=CA, 2=C
-        if i < p1:                              return T_n
-        if i == p1: return T_n  if atom < 2   else f1_transform
-        if i < p2:                              return f1_transform
-        if i == p2: return f1_transform if atom < 2 else f2_transform
-        if i < p3:                              return f2_transform
-        if i == p3: return f2_transform if atom == 0 else T_c
-        return T_c
+    # Vectorized transform application (replaces N_res×3 individual _apply4 calls).
+    # Build a flat view of all (N_res*3) atom positions: shape (N_res*3, 3).
+    # Then apply each of the 4 transforms to its atom group in one batched matmul.
+    #
+    # Transform regions (atom index = i*3 + a, with a: 0=N,1=CA,2=C):
+    #   T_n:          i <  p1  (all atoms)  +  i==p1, a<2
+    #   f1_transform: i==p1, a==2  +  p1<i<p2 (all)  +  i==p2, a<2
+    #   f2_transform: i==p2, a==2  +  p2<i<p3 (all)  +  i==p3, a==0
+    #   T_c:          i==p3, a>0   +  i>p3 (all)
 
-    out_bb = np.empty((N_res, 3, 3))
-    for i in range(N_res):
-        for a in range(3):
-            out_bb[i, a] = _apply4(_t(i, a), loop_bb[i, a])
+    flat = loop_bb.reshape(-1, 3)               # (N_res*3, 3)
+    out_flat = np.empty_like(flat)
+
+    def _apply_batch(M, pts):
+        """Apply 4×4 homogeneous M to pts (K,3): pts @ R.T + t."""
+        return pts @ M[:3, :3].T + M[:3, 3]
+
+    # Build flat atom index masks
+    idx = np.arange(N_res * 3)
+    res_idx  = idx // 3   # residue index for each flat atom
+    atom_idx = idx  % 3   # atom index (0=N,1=CA,2=C)
+
+    mask_tn  = ((res_idx < p1) |
+                ((res_idx == p1) & (atom_idx < 2)))
+    mask_f1  = (((res_idx == p1) & (atom_idx == 2)) |
+                ((res_idx > p1) & (res_idx < p2)) |
+                ((res_idx == p2) & (atom_idx < 2)))
+    mask_f2  = (((res_idx == p2) & (atom_idx == 2)) |
+                ((res_idx > p2) & (res_idx < p3)) |
+                ((res_idx == p3) & (atom_idx == 0)))
+    mask_tc  = (((res_idx == p3) & (atom_idx > 0)) |
+                (res_idx > p3))
+
+    for mask, M in ((mask_tn, T_n), (mask_f1, f1_transform),
+                    (mask_f2, f2_transform), (mask_tc, T_c)):
+        if mask.any():
+            out_flat[mask] = _apply_batch(M, flat[mask])
+
+    out_bb = out_flat.reshape(N_res, 3, 3)
 
     # Validate closure: N of c_stem predicted by T_c applied to loop[-1,N]
     pred_cstem_N = _apply4(T_c, loop_bb[-1, 0])

@@ -212,7 +212,7 @@ def parse_args():
                    help='Skip Class D predictions')
     p.add_argument('--classD-limit',        type=int,   default=0,
                    help='Limit Class D to first N sequences (0 = no limit)')
-    p.add_argument('--batch-tokens',        type=int,   default=262144,
+    p.add_argument('--batch-tokens',        type=int,   default=80000,
                    help='Max L² token budget per batch in classD (default: 262144). '
                         'Allows sequences up to ~512 aa to batch together.')
     p.add_argument('--no-compile',          action='store_true', default=False,
@@ -1172,7 +1172,7 @@ def _find_missing_segments(qp_map, full_qseq, min_len):
 def _predict_fragments_inprocess(frag_dict, work_dir,
                                   plddt_threshold, max_recyclings,
                                   min_recycle_plddt=50.0,
-                                  batch_tokens=262144, max_seq_len=800):
+                                  batch_tokens=80000, max_seq_len=800):
     """Predict fragments using batch multi-round recycling (same logic as Class D).
     Returns {name: pdb_path} for successes.
     """
@@ -1558,7 +1558,7 @@ def build_complete_structure(
     mm_iters=300, ccd_iters=200, ccd_tol=0.15, n_flank=3,
     min_frag_len=5, lbfgsb_iters=300, model_size='12L', anchor_k=1000.0,
     plddt_threshold=85.0, max_recyclings=2, min_recycle_plddt=50.0,
-    batch_tokens=262144, max_seq_len=800, loop_closer='ccd',
+    batch_tokens=80000, max_seq_len=800, loop_closer='ccd',
 ):
     t0 = time.perf_counter()
     try:

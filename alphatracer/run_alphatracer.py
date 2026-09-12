@@ -36,6 +36,7 @@ Usage
 """
 
 import argparse
+import glob as _glob
 import gzip
 import os
 import shutil
@@ -100,6 +101,26 @@ def _flag(name: str, value) -> list[str]:
 
 def _bool_flag(name: str, enabled: bool) -> list[str]:
     return [name] if enabled else []
+
+
+def _input_stem(path: str) -> str:
+    """Strip all extensions from a FASTA filename to get the bare stem."""
+    stem = Path(path).stem
+    while '.' in stem:
+        stem = Path(stem).stem
+    return stem
+
+
+def _expand_batch_fastas(patterns: list[str]) -> list[str]:
+    """Expand a list of paths/glob patterns to concrete file paths."""
+    result = []
+    for pat in patterns:
+        expanded = _glob.glob(pat)
+        if expanded:
+            result.extend(sorted(expanded))
+        else:
+            result.append(pat)   # treat as literal path; will fail later if absent
+    return result
 
 
 # ── Progress bar ───────────────────────────────────────────────────────────────
@@ -320,8 +341,13 @@ def parse_args() -> argparse.Namespace:
 
     # ── Required ──────────────────────────────────────────────────────────────
     p.add_argument(
-        '-i', '--input', required=True,
+        '-i', '--input', default=None,
         help='Input FASTA of query protein sequences',
+    )
+    p.add_argument(
+        '--batch', nargs='+', metavar='FASTA', default=None,
+        help='Process multiple proteomes in one batch, amortizing model/index loading costs. '
+             'Accepts file paths and glob patterns. Mutually exclusive with -i.',
     )
     p.add_argument(
         '--dbdir', default=None, metavar='DIR',
@@ -442,7 +468,7 @@ def parse_args() -> argparse.Namespace:
                         help='Skip Class D predictions')
     grp_cd.add_argument('--classD-limit', type=int, default=0,
                         help='Limit Class D to first N sequences (0=all)')
-    grp_cd.add_argument('--batch-tokens', type=int, default=700000,
+    grp_cd.add_argument('--batch-tokens', type=int, default=80000,
                         help='Max total tokens per MLX batch in Class D')
     grp_cd.add_argument('--max-seq-len', type=int, default=800,
                         help='Skip MLX prediction for sequences longer than this (0=no limit)')
@@ -473,6 +499,67 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+# ── Shared command builders ─────────────────────────────────────────────────────
+
+def _build_cmd_b(py_main, proc_dir, args, b_min_pctsim):
+    return [
+        py_main, _script('pipeline/AT_classB.py'),
+        '-i', proc_dir,
+        '-t', str(args.threads),
+        '--max-indels',         str(args.max_indels),
+        '--max-indel-len',      str(args.max_indel_len),
+        '--max-loop-indels',    str(args.max_loop_indels),
+        '--max-loop-indel-len', str(args.max_loop_indel_len),
+        '--min-pctsim',         str(b_min_pctsim),
+        '--mm-iters',      str(args.mm_iters),
+        '--ccd-iters',     str(args.ccd_iters),
+        '--ccd-tol',       str(args.ccd_tol),
+        '--flank',         str(args.flank),
+        '--loop-closer',   args.loop_closer,
+        *(['--full-pdbs'] if args.full_pdbs else []),
+        *_flag('--promod3-data-dir', args.promod3_data_dir),
+        *_flag('--limit', args.b_limit),
+    ]
+
+
+def _build_cmd_cd(py_cd, proc_dir, args, c_min_pctsim):
+    return [
+        py_cd, _script('pipeline/AT_classC_and_D.py'),
+        '-i', proc_dir,
+        '-t', str(args.threads),
+        '--min-pctsim',             str(c_min_pctsim),
+        '--window-size',            str(args.window_size),
+        '--pae-cutoff',             str(args.pae_cutoff),
+        '--pae-power',              str(args.pae_power),
+        '--pae-resolution',         str(args.pae_resolution),
+        '--pae-resolution-large',   str(args.pae_resolution_large),
+        '--large-domain-threshold', str(args.large_domain_threshold),
+        '--min-domain-size',        str(args.min_domain_size),
+        '--min-domain-plddt',       str(args.min_domain_plddt),
+        '--mm-iters',               str(args.mm_iters_C),
+        '--ccd-iters',              str(args.ccd_iters),
+        '--ccd-tol',                str(args.ccd_tol),
+        '--flank',                  str(args.flank),
+        '--loop-closer',            args.loop_closer,
+        '--backend',                args.backend,
+        *_flag('--promod3-data-dir', args.promod3_data_dir),
+        '--min-frag-len',           str(args.min_frag_len),
+        '--lbfgsb-iters',           str(args.lbfgsb_iters),
+        '--mini-model-size',        args.mini_model_size,
+        '--anchor-k',               str(args.anchor_k),
+        '--plddt-threshold',        str(args.plddt_threshold),
+        '--max-recyclings',         str(args.max_recyclings),
+        '--min-recycle-plddt',      str(args.min_recycle_plddt),
+        '--batch-tokens',           str(args.batch_tokens),
+        '--max-seq-len',            str(args.max_seq_len),
+        '--classC-top-k',           str(args.top_k),
+        *_flag('--limit',        args.c_limit),
+        *_flag('--classD-limit', args.classD_limit),
+        *_bool_flag('--no-fill-missing', not args.fill_missing),
+        *_bool_flag('--no-classD',    args.no_classD),
+    ]
+
+
 # ── Pipeline ───────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -490,11 +577,237 @@ def main() -> None:
     if args.database is None:
         args.database = os.path.join(dbdir, 'bacarc8080.dmnd')
 
+    py_main = args.python
+    py_cd   = args.classcd_python or py_main
+    verbose = args.verbose
+
+    b_min_pctsim = args.b_min_pctsim
+    c_min_pctsim = args.c_min_pctsim
+    search_method = 'diamond' if args.diamond else 'kmer'
+
+    # ── ProMod3 database setup ─────────────────────────────────────────────────
+    if args.loop_closer == 'promod3':
+        from setup_databases import ensure_promod3_databases, default_data_dir
+        data_dir = ensure_promod3_databases(
+            data_dir=args.promod3_data_dir, verbose=True)
+        os.environ['PROMOD3_SHARED_DATA_PATH'] = str(data_dir)
+
+    # ── Batch mode ────────────────────────────────────────────────────────────
+    if args.batch:
+        fasta_paths = _expand_batch_fastas(args.batch)
+        if not fasta_paths:
+            print('[batch] No input files found — nothing to do.')
+            return
+        proc_dirs = [
+            os.path.abspath(args.outdir) if args.outdir
+            else f'AT_processing_{_input_stem(fp)}'
+            for fp in fasta_paths
+        ]
+        for pd in proc_dirs:
+            os.makedirs(pd, exist_ok=True)
+
+        # Use first proc_dir for the shared log and progress bar.
+        log_path = os.path.join(proc_dirs[0], 'alphatracer_batch.log')
+
+        print('=' * 60)
+        print('AlphaTracer  —  Batch Pipeline Wrapper')
+        print('=' * 60)
+        print(f'  Proteomes:    {len(fasta_paths)}')
+        for fp, pd in zip(fasta_paths, proc_dirs):
+            print(f'    {fp}  →  {pd}/')
+        print(f'  DB dir:       {dbdir}')
+        print(f'  Search:       {search_method}')
+        print(f'  Python (A/B): {py_main}')
+        print(f'  Python (C/D): {py_cd}')
+        print(f'  Loop closer:  {args.loop_closer}')
+        print(f'  Backend:      {args.backend}')
+        if not verbose:
+            print(f'  Log:          {log_path}')
+        print()
+
+        def run(cmd, label, extra_env=None):
+            if verbose:
+                _run(cmd, label, extra_env)
+            else:
+                _run_quiet(cmd, label, log_path, extra_env)
+
+        # ── Class A batch ─────────────────────────────────────────────────────
+        if not args.skip_classA:
+            if args.diamond:
+                sys.exit('[FATAL] --batch with --diamond is not yet supported')
+            else:
+                # Phase 1: classify-only for all proteomes in one subprocess
+                if verbose:
+                    bar_inst = None
+                else:
+                    bar_inst = None   # no per-proteome bar in batch mode
+                cmd_a_classify = [
+                    py_main, _script('pipeline/AT_classA_kmer.py'),
+                    '--batch', *fasta_paths,
+                    '--outdirs', *proc_dirs,
+                    '-t', str(args.threads),
+                    '--top-k',       str(args.top_k),
+                    '--window-size', str(args.window_size),
+                    '--pctsim',      str(args.pctsim),
+                    '--classify-only',
+                    *_flag('--sketch-db', args.sketch_db),
+                ]
+                run(cmd_a_classify, 'Class A — classify batch (kmer)')
+
+                # Phase 2: download+build for all proteomes, concurrent with Class B
+                cmd_a_dl = [
+                    py_main, _script('pipeline/AT_classA_kmer.py'),
+                    '--batch', *fasta_paths,
+                    '--outdirs', *proc_dirs,
+                    '-t', str(args.threads),
+                    '--top-k',              str(args.top_k),
+                    '--window-size',        str(args.window_size),
+                    '--pctsim',             str(args.pctsim),
+                    '--download-build-only',
+                    *_flag('--sketch-db', args.sketch_db),
+                ]
+
+                if not args.skip_classB:
+                    cmd_b = [
+                        py_main, _script('pipeline/AT_classB.py'),
+                        '--batch', *proc_dirs,
+                        '-t', str(args.threads),
+                        '--max-indels',         str(args.max_indels),
+                        '--max-indel-len',      str(args.max_indel_len),
+                        '--max-loop-indels',    str(args.max_loop_indels),
+                        '--max-loop-indel-len', str(args.max_loop_indel_len),
+                        '--min-pctsim',         str(b_min_pctsim),
+                        '--mm-iters',      str(args.mm_iters),
+                        '--ccd-iters',     str(args.ccd_iters),
+                        '--ccd-tol',       str(args.ccd_tol),
+                        '--flank',         str(args.flank),
+                        '--loop-closer',   args.loop_closer,
+                        *(['--full-pdbs'] if args.full_pdbs else []),
+                        *_flag('--promod3-data-dir', args.promod3_data_dir),
+                        *_flag('--limit', args.b_limit),
+                    ]
+
+                    if verbose:
+                        print()
+                        print('=' * 60)
+                        print('  AlphaTracer  ►  Class A download + Class B  [concurrent, batch]')
+                        print('=' * 60)
+
+                    def _run_sub(cmd, label):
+                        env = _make_env()
+                        if verbose:
+                            result = subprocess.run(cmd, env=env)
+                        else:
+                            with open(log_path, 'a') as lf:
+                                lf.write(f'\n=== {label} ===\n')
+                                result = subprocess.run(cmd, env=env, stdout=lf, stderr=lf)
+                        if result.returncode != 0:
+                            if not verbose:
+                                sys.stdout.write('\n')
+                            msg = f'\n[FATAL] {label} exited with code {result.returncode}.'
+                            if not verbose:
+                                msg += f'\n        See {log_path} for details.'
+                            sys.exit(msg + ' Aborting.')
+
+                    with ThreadPoolExecutor(max_workers=2) as ex:
+                        fut_a = ex.submit(_run_sub, cmd_a_dl, 'Class A download+build (batch)')
+                        fut_b = ex.submit(_run_sub, cmd_b, 'Class B (batch)')
+                        for fut in as_completed([fut_a, fut_b]):
+                            fut.result()
+                    if verbose:
+                        print('  [concurrent batch phase complete]')
+                else:
+                    run(cmd_a_dl, 'Class A — download+build batch (kmer)')
+                    if verbose:
+                        print('[SKIP] Class B')
+        else:
+            if verbose:
+                print('[SKIP] Class A (batch)')
+            if not args.skip_classB:
+                cmd_b = [
+                    py_main, _script('pipeline/AT_classB.py'),
+                    '--batch', *proc_dirs,
+                    '-t', str(args.threads),
+                    '--max-indels',         str(args.max_indels),
+                    '--max-indel-len',      str(args.max_indel_len),
+                    '--max-loop-indels',    str(args.max_loop_indels),
+                    '--max-loop-indel-len', str(args.max_loop_indel_len),
+                    '--min-pctsim',         str(b_min_pctsim),
+                    '--mm-iters',      str(args.mm_iters),
+                    '--ccd-iters',     str(args.ccd_iters),
+                    '--ccd-tol',       str(args.ccd_tol),
+                    '--flank',         str(args.flank),
+                    '--loop-closer',   args.loop_closer,
+                    *(['--full-pdbs'] if args.full_pdbs else []),
+                    *_flag('--promod3-data-dir', args.promod3_data_dir),
+                    *_flag('--limit', args.b_limit),
+                ]
+                run(cmd_b, 'Class B (batch)')
+
+        # ── Class C + D batch ─────────────────────────────────────────────────
+        if not args.skip_classC:
+            for pd in proc_dirs:
+                for _stale in ('.cd_status', '.classC_total', '.classD_total'):
+                    try:
+                        os.remove(os.path.join(pd, _stale))
+                    except FileNotFoundError:
+                        pass
+            cmd_cd = [
+                py_cd, _script('pipeline/AT_classC_and_D.py'),
+                '--batch', *proc_dirs,
+                '-t', str(args.threads),
+                '--min-pctsim',             str(c_min_pctsim),
+                '--window-size',            str(args.window_size),
+                '--pae-cutoff',             str(args.pae_cutoff),
+                '--pae-power',              str(args.pae_power),
+                '--pae-resolution',         str(args.pae_resolution),
+                '--pae-resolution-large',   str(args.pae_resolution_large),
+                '--large-domain-threshold', str(args.large_domain_threshold),
+                '--min-domain-size',        str(args.min_domain_size),
+                '--min-domain-plddt',       str(args.min_domain_plddt),
+                '--mm-iters',               str(args.mm_iters_C),
+                '--ccd-iters',              str(args.ccd_iters),
+                '--ccd-tol',                str(args.ccd_tol),
+                '--flank',                  str(args.flank),
+                '--loop-closer',            args.loop_closer,
+                '--backend',                args.backend,
+                *_flag('--promod3-data-dir', args.promod3_data_dir),
+                '--min-frag-len',           str(args.min_frag_len),
+                '--lbfgsb-iters',           str(args.lbfgsb_iters),
+                '--mini-model-size',        args.mini_model_size,
+                '--anchor-k',               str(args.anchor_k),
+                '--plddt-threshold',        str(args.plddt_threshold),
+                '--max-recyclings',         str(args.max_recyclings),
+                '--min-recycle-plddt',      str(args.min_recycle_plddt),
+                '--batch-tokens',           str(args.batch_tokens),
+                '--max-seq-len',            str(args.max_seq_len),
+                '--classC-top-k',           str(args.top_k),
+                *_flag('--limit',        args.c_limit),
+                *_flag('--classD-limit', args.classD_limit),
+                *_bool_flag('--no-fill-missing', not args.fill_missing),
+                *_bool_flag('--no-classD',    args.no_classD),
+            ]
+            run(cmd_cd, 'Class C + D (batch)', extra_env={'KMP_DUPLICATE_LIB_OK': 'TRUE'})
+        else:
+            if verbose:
+                print('[SKIP] Class C/D (batch)')
+
+        print()
+        print('=' * 60)
+        print('AlphaTracer  —  Batch pipeline complete.')
+        for fp, pd in zip(fasta_paths, proc_dirs):
+            print(f'  {fp}  →  {pd}/')
+        if not verbose:
+            print(f'  Full log:  {log_path}')
+        print('=' * 60)
+        return
+
+    # ── Single-proteome mode ───────────────────────────────────────────────────
+    if args.input is None:
+        sys.exit('[FATAL] -i / --input is required (or use --batch)')
+
     input_path   = Path(args.input)
     proc_dir     = os.path.abspath(args.outdir) if args.outdir else f'AT_processing_{input_path.stem}'
-    py_main      = args.python
-    py_cd        = args.classcd_python or py_main
-    verbose      = args.verbose
     log_path     = os.path.join(proc_dir, 'alphatracer.log')
 
     total_seqs   = _count_fasta(args.input)
@@ -502,9 +815,6 @@ def main() -> None:
     print('=' * 60)
     print('AlphaTracer  —  Full Pipeline Wrapper')
     print('=' * 60)
-    search_method = 'diamond' if args.diamond else 'kmer'
-    b_min_pctsim  = args.b_min_pctsim
-    c_min_pctsim  = args.c_min_pctsim
 
     print(f'  Input:        {args.input}  ({total_seqs} sequences)')
     print(f'  DB dir:       {dbdir}')
@@ -523,13 +833,6 @@ def main() -> None:
     if not verbose:
         print(f'  Log:          {log_path}')
     print()
-
-    # ── ProMod3 database setup ─────────────────────────────────────────────────
-    if args.loop_closer == 'promod3':
-        from setup_databases import ensure_promod3_databases, default_data_dir
-        data_dir = ensure_promod3_databases(
-            data_dir=args.promod3_data_dir, verbose=True)
-        os.environ['PROMOD3_SHARED_DATA_PATH'] = str(data_dir)
 
     # ── Set up quiet-mode progress bar ────────────────────────────────────────
     bar: _StatusBar | None = None
@@ -561,25 +864,7 @@ def main() -> None:
             if not args.skip_classB:
                 if bar:
                     bar.phase('Building Class B structures...')
-                cmd_b = [
-                    py_main, _script('pipeline/AT_classB.py'),
-                    '-i', proc_dir,
-                    '-t', str(args.threads),
-                    '--max-indels',         str(args.max_indels),
-                    '--max-indel-len',      str(args.max_indel_len),
-                    '--max-loop-indels',    str(args.max_loop_indels),
-                    '--max-loop-indel-len', str(args.max_loop_indel_len),
-                    '--min-pctsim',         str(b_min_pctsim),
-                    '--mm-iters',      str(args.mm_iters),
-                    '--ccd-iters',     str(args.ccd_iters),
-                    '--ccd-tol',       str(args.ccd_tol),
-                    '--flank',         str(args.flank),
-                    '--loop-closer',   args.loop_closer,
-                    *(['--full-pdbs'] if args.full_pdbs else []),
-                    *_flag('--promod3-data-dir', args.promod3_data_dir),
-                    *_flag('--limit', args.b_limit),
-                ]
-                run(cmd_b, 'Class B')
+                run(_build_cmd_b(py_main, proc_dir, args, b_min_pctsim), 'Class B')
             else:
                 if verbose:
                     print('[SKIP] Class B')
@@ -614,24 +899,7 @@ def main() -> None:
             ]
 
             if not args.skip_classB:
-                cmd_b = [
-                    py_main, _script('pipeline/AT_classB.py'),
-                    '-i', proc_dir,
-                    '-t', str(args.threads),
-                    '--max-indels',         str(args.max_indels),
-                    '--max-indel-len',      str(args.max_indel_len),
-                    '--max-loop-indels',    str(args.max_loop_indels),
-                    '--max-loop-indel-len', str(args.max_loop_indel_len),
-                    '--min-pctsim',         str(b_min_pctsim),
-                    '--mm-iters',      str(args.mm_iters),
-                    '--ccd-iters',     str(args.ccd_iters),
-                    '--ccd-tol',       str(args.ccd_tol),
-                    '--flank',         str(args.flank),
-                    '--loop-closer',   args.loop_closer,
-                    *(['--full-pdbs'] if args.full_pdbs else []),
-                    *_flag('--promod3-data-dir', args.promod3_data_dir),
-                    *_flag('--limit', args.b_limit),
-                ]
+                cmd_b = _build_cmd_b(py_main, proc_dir, args, b_min_pctsim)
 
                 if verbose:
                     print()
@@ -677,25 +945,7 @@ def main() -> None:
         if not args.skip_classB:
             if bar:
                 bar.phase('Building Class B structures...')
-            cmd_b = [
-                py_main, _script('pipeline/AT_classB.py'),
-                '-i', proc_dir,
-                '-t', str(args.threads),
-                '--max-indels',         str(args.max_indels),
-                '--max-indel-len',      str(args.max_indel_len),
-                '--max-loop-indels',    str(args.max_loop_indels),
-                '--max-loop-indel-len', str(args.max_loop_indel_len),
-                '--min-pctsim',         str(b_min_pctsim),
-                '--mm-iters',      str(args.mm_iters),
-                '--ccd-iters',     str(args.ccd_iters),
-                '--ccd-tol',       str(args.ccd_tol),
-                '--flank',         str(args.flank),
-                '--loop-closer',   args.loop_closer,
-                *(['--full-pdbs'] if args.full_pdbs else []),
-                *_flag('--promod3-data-dir', args.promod3_data_dir),
-                *_flag('--limit', args.b_limit),
-            ]
-            run(cmd_b, 'Class B')
+            run(_build_cmd_b(py_main, proc_dir, args, b_min_pctsim), 'Class B')
         else:
             if verbose:
                 print('[SKIP] Class B')
@@ -711,42 +961,8 @@ def main() -> None:
                 pass
         if bar:
             bar.phase('Building Class C and D structures...')
-        cmd_cd = [
-            py_cd, _script('pipeline/AT_classC_and_D.py'),
-            '-i', proc_dir,
-            '-t', str(args.threads),
-            '--min-pctsim',             str(c_min_pctsim),
-            '--window-size',            str(args.window_size),
-            '--pae-cutoff',             str(args.pae_cutoff),
-            '--pae-power',              str(args.pae_power),
-            '--pae-resolution',         str(args.pae_resolution),
-            '--pae-resolution-large',   str(args.pae_resolution_large),
-            '--large-domain-threshold', str(args.large_domain_threshold),
-            '--min-domain-size',        str(args.min_domain_size),
-            '--min-domain-plddt',       str(args.min_domain_plddt),
-            '--mm-iters',               str(args.mm_iters_C),
-            '--ccd-iters',              str(args.ccd_iters),
-            '--ccd-tol',                str(args.ccd_tol),
-            '--flank',                  str(args.flank),
-            '--loop-closer',            args.loop_closer,
-            '--backend',                args.backend,
-            *_flag('--promod3-data-dir', args.promod3_data_dir),
-            '--min-frag-len',           str(args.min_frag_len),
-            '--lbfgsb-iters',           str(args.lbfgsb_iters),
-            '--mini-model-size',        args.mini_model_size,
-            '--anchor-k',               str(args.anchor_k),
-            '--plddt-threshold',        str(args.plddt_threshold),
-            '--max-recyclings',         str(args.max_recyclings),
-            '--min-recycle-plddt',      str(args.min_recycle_plddt),
-            '--batch-tokens',           str(args.batch_tokens),
-            '--max-seq-len',            str(args.max_seq_len),
-            '--classC-top-k',           str(args.top_k),
-            *_flag('--limit',        args.c_limit),
-            *_flag('--classD-limit', args.classD_limit),
-            *_bool_flag('--no-fill-missing', not args.fill_missing),
-            *_bool_flag('--no-classD',    args.no_classD),
-        ]
-        run(cmd_cd, 'Class C + D', extra_env={'KMP_DUPLICATE_LIB_OK': 'TRUE'})
+        run(_build_cmd_cd(py_cd, proc_dir, args, c_min_pctsim),
+            'Class C + D', extra_env={'KMP_DUPLICATE_LIB_OK': 'TRUE'})
     else:
         if verbose:
             print('[SKIP] Class C/D')
